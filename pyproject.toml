@@ -1,0 +1,47 @@
+[project]
+name = "drive-sync"
+version = "1.0.0"
+description = "Keep folders on this PC backed up to Google Drive"
+requires-python = ">=3.10"
+# Exact versions (with hashes) are pinned in uv.lock. After changing this list run:
+#   uv lock
+#   uv export --no-dev --no-emit-project -o requirements.txt
+dependencies = [
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.2",
+    "google-auth>=2.23",
+    "pystray>=0.19",
+    "pillow>=10.0",
+    "customtkinter>=5.2",
+    "requests>=2.31",
+    "watchdog>=4.0",
+    "send2trash>=1.8",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "bandit[toml]>=1.7",
+    "pip-audit>=2.7",
+    "pyinstaller>=6.0",
+    "pre-commit>=3.5",
+    "zizmor>=1.0",
+]
+
+[tool.uv]
+package = false   # an app, not a library to publish
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, bugbear, pyupgrade, import sorting
+select = ["E", "F", "W", "B", "UP", "I"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "build", "dist", ".venv"]
+# B101: assert is fine in tests.
+# B404/B603/B606: the app only launches fixed programs by absolute path (notepad.exe,
+# powershell.exe, Explorer for a folder the user picked) - never with a shell or user-typed commands.
+skips = ["B101", "B404", "B603", "B606"]

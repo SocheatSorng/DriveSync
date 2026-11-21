@@ -1,0 +1,16 @@
+# Opens pull requests when GitHub Actions (pinned SHAs) or Python packages (uv.lock)
+# have updates, including security fixes.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7   # wait a week before adopting brand-new releases (supply-chain safety)
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

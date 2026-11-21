@@ -1,0 +1,23 @@
+# --- Secrets: NEVER commit these (gitleaks also checks) ---
+credentials.json
+client_secret*.json
+token.json
+accounts/
+
+# --- Local app data ---
+config.json
+config.tmp
+state/
+logs/
+.show
+*.log
+
+# --- Python / build output ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+.ruff_cache/

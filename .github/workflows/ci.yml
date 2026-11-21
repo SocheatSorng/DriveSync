@@ -1,0 +1,106 @@
+# Lint + test on every push / pull request, build DriveSync.exe,
+# and publish it as a GitHub Release when you push a tag like v1.0.0:
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# Security notes:
+# - Every third-party action is pinned to a full commit SHA (tags can be moved; SHAs can't).
+#   Dependabot keeps the SHAs up to date.
+# - Harden-Runner records every network connection the runner makes (audit mode).
+# - Dependencies come from uv.lock (exact versions + hashes), never "latest".
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint & test (Python ${{ matrix.python }})
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: false   # this workflow publishes releases; don't trust shared caches (cache poisoning)
+      - name: Install (exactly what uv.lock says)
+        run: uv sync --locked
+      - name: Ruff (lint)
+        run: uv run ruff check .
+      - name: Unit tests
+        run: uv run python -m unittest discover -v -p "test_*.py"
+      - name: requirements.txt matches uv.lock
+        shell: bash
+        run: |
+          uv export --no-dev --no-emit-project --quiet -o requirements.txt
+          git diff --ignore-cr-at-eol --exit-code requirements.txt || {
+            echo "::error::requirements.txt is out of date. Run: uv export --no-dev --no-emit-project -o requirements.txt"
+            exit 1
+          }
+
+  build:
+    name: Build DriveSync.exe
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: "3.13"
+          enable-cache: false   # never build a release from a cache another run could have written
+      - run: uv sync --locked
+      - name: PyInstaller
+        run: uv run powershell -ExecutionPolicy Bypass -File build.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: DriveSync-exe
+          path: dist/DriveSync.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the release
+    steps:
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: DriveSync-exe
+      # GitHub's own CLI (preinstalled) - no third-party action gets write access to the repo.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" DriveSync.exe --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag

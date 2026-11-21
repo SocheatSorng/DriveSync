@@ -1,0 +1,653 @@
+"""
+Drive Sync desktop app: main window + system-tray icon + background syncing.
+
+    pythonw tray_app.py            open the window
+    pythonw tray_app.py --hidden   start in the tray only (used at Windows login)
+
+Settings are stored in config.json in the app folder (see drive_sync.APP_DIR).
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import logging
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import customtkinter as ctk
+import pystray
+from PIL import Image, ImageDraw
+
+import accounts
+import activity
+import browsers
+from drive_sync import APP_DIR, DEFAULT_EXCLUDES, RESOURCE_DIR, Drive, build_service, sync_folder
+from progress import Progress, count_files
+from watcher import ChangeTracker, FolderWatcher
+
+CONFIG_PATH = APP_DIR / "config.json"
+CREDS_PATH = APP_DIR / "credentials.json"
+TOKEN_PATH = APP_DIR / "token.json"
+LOG_PATH = APP_DIR / "logs" / "drive_sync.log"
+SHOW_FLAG = APP_DIR / ".show"
+ICO_PATH = RESOURCE_DIR / "assets" / "drivesync.ico"
+STARTUP_LNK = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/Drive Sync.lnk"
+WINDIR = Path(os.environ.get("WINDIR", r"C:\Windows"))
+NOTEPAD = WINDIR / "notepad.exe"
+POWERSHELL = WINDIR / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+DRIVE_SETTLE_SECONDS = 1.0  # Drive-side changes: short wait (a few files often change together)
+
+DEFAULT_CONFIG = {
+    "interval_minutes": 15,
+    "startup_delay_seconds": 30,
+    "watch_changes": True,   # sync a folder seconds after something in it changes
+    "drive_poll_seconds": 10,  # two-way: how often to ask Google "anything new?" (one small request)
+    "notify_on_changes": False,
+    "appearance": "System",
+    "folders": [],
+}
+log = logging.getLogger("drive_sync")
+
+
+# --------------------------------------------------------------------------- #
+def make_icon(color: str, paused: bool = False) -> Image.Image:
+    """Round badge with an upload arrow (or pause bars)."""
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((2, 2, 62, 62), fill=color)
+    if paused:
+        d.rectangle((21, 18, 28, 46), fill="white")
+        d.rectangle((36, 18, 43, 46), fill="white")
+    else:
+        d.polygon([(32, 12), (49, 31), (39, 31), (39, 50), (25, 50), (25, 31), (15, 31)], fill="white")
+    return img
+
+
+ICONS = {
+    "idle": make_icon("#1a73e8"),     # blue   - up to date
+    "syncing": make_icon("#f9ab00"),  # amber  - working
+    "error": make_icon("#d93025"),    # red    - needs attention
+    "paused": make_icon("#80868b", paused=True),
+}
+
+
+def single_instance() -> bool:
+    """False if another copy is already running."""
+    ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\DriveSyncTrayApp")
+    return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+
+
+
+# --------------------------------------------------------------------------- #
+class App:
+    def __init__(self, start_hidden: bool):
+        self.ui: queue.Queue = queue.Queue()
+        self.wake = threading.Event()
+        self.stopping = threading.Event()
+        self.paused = False
+        self.state, self.status, self.detail = "idle", "Starting…", ""
+        self.drives: dict[str, Drive] = {}          # email -> connected Drive (worker thread only)
+        self.needs_signin: set[str] = set()         # accounts whose login expired / was revoked
+        self.signing_in: str | None = None          # "new" or an email while the browser flow runs
+        self.force_full = False                     # "Sync now" pressed
+        self.activity = activity.ActivityStore(APP_DIR / "activity.jsonl")
+        self.last_check: dict | None = None         # most recent sync, even if nothing changed
+        self.progress: Progress | None = None       # set while a sync runs
+        self.change_tokens: dict[str, str] = {}     # account -> Drive change-feed position
+        self.drive_marked: set = set()              # folders queued because Drive changed
+        self._last_event_key = None
+        self.changes = ChangeTracker()              # folders changed on disk, waiting to settle
+        self.watcher = FolderWatcher(self._on_folder_changed, ignore_under=(str(APP_DIR),))
+        self.remote_ids: dict[tuple[str, str], str] = {}  # (local folder, account) -> Drive folder id
+        self.show_flag = SHOW_FLAG
+        self.readme_path = RESOURCE_DIR / "README.md"
+        self.start_hidden = start_hidden
+        self.cfg = self.load_config()
+
+        ctk.set_appearance_mode(self.cfg.get("appearance", "System").lower())
+        ctk.set_default_color_theme("blue")
+        self.root = ctk.CTk()
+        if start_hidden:
+            self.root.withdraw()
+        from gui import MainWindow  # after CTk() exists
+        self.window = MainWindow(self.root, self, build=not start_hidden)  # built when first opened
+
+        self.icon = pystray.Icon("DriveSync", ICONS["idle"], "Drive Sync", menu=pystray.Menu(
+            pystray.MenuItem(lambda _: self.status, None, enabled=False),
+            pystray.MenuItem(lambda _: self.menu_detail(), None, enabled=False,
+                             visible=lambda _: bool(self.menu_detail())),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open Drive Sync", lambda *_: self.ui.put(("show",)), default=True),
+            pystray.MenuItem("Sync now", lambda *_: self.sync_now()),
+            pystray.MenuItem("Pause syncing", lambda *_: self.toggle_pause(), checked=lambda _: self.paused),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", lambda *_: self.ui.put(("quit",))),
+        ))
+
+    # ---------------------------------------------------------------- config
+    def load_config(self) -> dict:
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            data = {}
+        except ValueError as e:
+            log.error("config.json is not valid JSON (%s) - using defaults", e)
+            data = {}
+        cfg = {**DEFAULT_CONFIG, **data}
+        cfg["folders"] = [f for f in cfg.get("folders", []) if isinstance(f, dict) and f.get("local")]
+        return cfg
+
+    def save_config(self, cfg: dict) -> None:
+        self.cfg = cfg
+        tmp = CONFIG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        tmp.replace(CONFIG_PATH)
+        log.info("Settings saved")
+        self.refresh_watchers()  # folders / exclusions / instant-sync switch may have changed
+
+    # ----------------------------------------------------------------- state
+    def set_state(self, state: str, status: str, detail: str = "") -> None:
+        self.state, self.status, self.detail = state, status, detail
+        try:
+            self.icon.icon = ICONS["paused" if self.paused and state != "syncing" else state]
+            tip = f"Drive Sync - {status}" + (f"\n{detail}" if state == "syncing" and detail else "")
+            self.icon.title = tip[:127]  # Windows tooltip limit
+            self.icon.update_menu()
+        except Exception as e:  # noqa: BLE001 - icon may not be running yet
+            log.debug("Tray icon not ready: %s", e)
+        self.ui.put(("state",))
+
+    def notify(self, msg: str) -> None:
+        try:
+            self.icon.notify(msg, "Drive Sync")
+        except Exception as e:  # noqa: BLE001 - notifications are best-effort
+            log.debug("Notification failed: %s", e)
+
+    def icon_image(self, state: str) -> Image.Image:
+        return ICONS[state]
+
+    def apply_window_icon(self, win) -> None:
+        if ICO_PATH.exists():
+            try:
+                win.iconbitmap(str(ICO_PATH))
+            except Exception as e:  # noqa: BLE001
+                log.debug("Couldn't set window icon: %s", e)
+
+    # ---------------------------------------------------------------- worker
+    def worker(self) -> None:
+        """Full sync at start and on the timer (safety net); changed folders sync within seconds."""
+        delay = self.cfg.get("startup_delay_seconds", 30) if self.start_hidden else 1
+        self.set_state("idle", "Starting…", "Waiting for the network" if self.start_hidden else "")
+        self.wake.wait(delay)
+        self.wake.clear()
+        next_full = time.monotonic()  # sync everything right away
+        next_poll = time.monotonic()  # first poll only records where Drive's change feed starts
+        first = True
+        while not self.stopping.is_set():
+            if not self.paused and time.monotonic() >= next_poll:
+                self._poll_drive()  # marks two-way folders whose Drive account has new changes
+                next_poll = time.monotonic() + self._poll_interval()
+            if not self.paused:
+                if self.force_full or time.monotonic() >= next_full:
+                    trigger = "manual" if self.force_full else "startup" if first else "scheduled"
+                    self.force_full, first = False, False
+                    self.changes.clear()  # a full sync covers everything changed so far
+                    ok = self.sync_all(trigger=trigger)
+                    next_full = time.monotonic() + (self._interval() if ok else min(self._interval(), 120))
+                else:
+                    changed = self.changes.take_settled()
+                    trigger = "drive" if changed and changed <= self.drive_marked else "changes"
+                    self.drive_marked -= changed
+                    if changed and not self.sync_all(only=changed, trigger=trigger):
+                        next_full = min(next_full, time.monotonic() + 120)  # retry soon
+            # Sleep until the timer, the next settled change, or a wake-up (change / Sync now / quit).
+            due = [next_full, next_poll] if not self.paused else []
+            if not self.paused and (settle := self.changes.next_due()) is not None:
+                due.append(settle)
+            timeout = max(0.5, min(due) - time.monotonic()) if due else None
+            self.wake.wait(timeout)
+            self.wake.clear()
+
+    def _poll_drive(self) -> None:
+        """Ask Google (cheaply) whether anything changed in each two-way account since last time."""
+        cfg = self.load_config()
+        known = accounts.list_accounts()
+        by_account: dict[str, list] = {}
+        for f in cfg.get("folders", []):
+            if f.get("mode", "two_way") == "two_way":
+                email = self.folder_account(f, known)
+                if email in known and email not in self.needs_signin:
+                    by_account.setdefault(email, []).append(self.folder_key(f, known))
+        for email, keys in by_account.items():
+            try:
+                drive = self.drives.get(email) or self._drive_for(email, known)
+                if drive is None:
+                    continue
+                token = self.change_tokens.get(email)
+                if token is None:
+                    self.change_tokens[email] = drive.changes_start_token()
+                    continue
+                changed, self.change_tokens[email] = drive.changes_since(token)
+                if changed:
+                    log.info("Changes on Google Drive (%s) - checking two-way folders", email)
+                    for key in keys:
+                        self.drive_marked.add(key)
+                        self.changes.mark(key, settle=DRIVE_SETTLE_SECONDS)
+            except Exception as e:  # noqa: BLE001 - offline etc.; the timer still covers it
+                log.debug("Couldn't check Drive for changes (%s): %s", email, e)
+
+    def _poll_interval(self) -> float:
+        try:
+            return min(300.0, max(5.0, float(self.cfg.get("drive_poll_seconds", 10))))
+        except (TypeError, ValueError):
+            return 10.0
+
+    def _interval(self) -> float:
+        try:
+            return max(1, float(self.load_config()["interval_minutes"])) * 60
+        except (TypeError, ValueError, KeyError):
+            return 15 * 60
+
+    # ---------------------------------------------------------------- watching
+    @staticmethod
+    def folder_key(folder: dict, known: list[str]) -> tuple[str, str | None]:
+        return os.path.normcase(os.path.normpath(folder["local"])), App.folder_account(folder, known)
+
+    def _on_folder_changed(self, key) -> None:  # called from the watcher thread
+        self.changes.mark(key)
+        self.wake.set()
+
+    def refresh_watchers(self) -> None:
+        """Watch exactly the configured folders (or none, if instant sync is off)."""
+        if self.stopping.is_set():
+            return
+        cfg = self.cfg
+        wanted = {}
+        if cfg.get("watch_changes", True):
+            known = accounts.list_accounts()
+            for f in cfg.get("folders", []):
+                excludes = list(DEFAULT_EXCLUDES) + list(f.get("exclude", []))
+                wanted[self.folder_key(f, known)] = (os.path.normpath(f["local"]), excludes)
+        try:
+            self.watcher.update(wanted)
+        except Exception as e:  # noqa: BLE001 - never let watching break the app; the timer still works
+            log.warning("Couldn't watch folders for changes: %s", e)
+        self.ui.put(("state",))
+
+    # -------------------------------------------------------------- accounts
+    @staticmethod
+    def folder_account(folder: dict, known: list[str]) -> str | None:
+        """The account a folder syncs to (folders saved before accounts existed use the first one)."""
+        acc = (folder.get("account") or "").strip().lower()
+        return acc or (known[0] if known else None)
+
+    def _migrate_legacy_token(self) -> None:
+        """Older versions kept a single login in token.json - turn it into a named account."""
+        if not TOKEN_PATH.exists():
+            return
+        from google.auth.exceptions import RefreshError
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+
+        from drive_sync import SCOPES
+        try:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+            if not creds.valid and creds.refresh_token:
+                creds.refresh(Request())
+            email = accounts.account_email(build_service(creds))
+            accounts.save_account(email, creds.to_json())
+            TOKEN_PATH.unlink()
+            log.info("Moved the existing login to account %s", email)
+            self.ui.put(("account_added", email))
+        except RefreshError:
+            TOKEN_PATH.unlink(missing_ok=True)
+            log.warning("The old login had expired - add your Google account again in Settings")
+        except Exception as e:  # noqa: BLE001 - probably offline; try again next sync
+            log.warning("Couldn't convert the old login yet: %s", e)
+
+    def _drive_for(self, email: str | None, known: list[str]) -> Drive | None:
+        if not email or email not in known:
+            log.error("This folder uses the Google account %s, which isn't added on this PC", email or "(none)")
+            return None
+        if email in self.drives:
+            return self.drives[email]
+        try:
+            drive = Drive(build_service(accounts.load_credentials(email)))
+        except accounts.NeedsSignIn as e:
+            log.error("%s - sign in again in Settings", e)
+            self.record_event("warning", f"{email} needs to sign in again",
+                              "Settings → Google accounts → Sign in again")
+            self.needs_signin.add(email)
+            self.ui.put(("account",))
+            return None
+        except Exception as e:  # noqa: BLE001 - offline etc.
+            log.error("Can't connect to Google Drive for %s: %s", email, e)
+            return None
+        self.drives[email] = drive
+        if email in self.needs_signin:
+            self.needs_signin.discard(email)
+            self.ui.put(("account",))
+        return drive
+
+    # -------------------------------------------------------------- progress
+    def _on_progress(self, p: Progress) -> None:
+        """Called (throttled) from the sync thread: update the tray menu, tooltip and window."""
+        folder = Path(p.folder).name if p.folder else ""
+        self.set_state("syncing", f"Syncing… {p.percent}%",
+                       f"{p.current()} · {p.counter()}" + (f" · {folder}" if folder else ""))
+
+    def menu_detail(self) -> str:
+        text = self.detail if self.state == "syncing" else ""
+        return text if len(text) <= 70 else text[:69] + "…"
+
+    # -------------------------------------------------------------- activity
+    def _record(self, entry: dict) -> None:
+        """Save an Activity entry (runs that changed nothing are skipped) and show it."""
+        if not activity.is_worth_keeping(entry):
+            return
+        self.activity.append(entry)
+        self.ui.put(("activity", entry))
+
+    def record_event(self, level: str, message: str, detail: str = "") -> None:
+        # Don't repeat the same warning every retry (e.g. offline for an hour).
+        key = (level, message, detail)
+        if level != "info" and key == self._last_event_key:
+            return
+        self._last_event_key = key
+        self._record(activity.new_event(level, message, detail))
+
+    @staticmethod
+    def _is_auth_error(e: Exception) -> bool:
+        from google.auth.exceptions import RefreshError
+        return isinstance(e, RefreshError) or "invalid_grant" in str(e) or "401" in str(e)
+
+    # ------------------------------------------------------------------ sync
+    def sync_all(self, only: set | None = None, trigger: str = "scheduled") -> bool:
+        """Sync every folder, or only the folders whose keys are in `only` (changed folders)."""
+        self.set_state("syncing", "Syncing changes…" if only else "Syncing…")
+        if not CREDS_PATH.exists():
+            self.set_state("error", "Set up Google access", "Settings → Import credentials.json")
+            return False
+        self._migrate_legacy_token()
+        known = accounts.list_accounts()
+        if not known:
+            self.set_state("error", "No Google account yet", "Settings → Add Google account")
+            return False
+        cfg = self.load_config()
+        folders = cfg["folders"]
+        if not folders:
+            self.set_state("idle", "No folders yet", "Add a folder to start backing up")
+            return True
+
+        if only is not None:
+            folders = [f for f in folders if self.folder_key(f, known) in only]
+
+        totals = dict(uploaded=0, updated=0, trashed=0, downloaded=0, deleted_local=0, conflicts=0, errors=0)
+        # Count files first so the UI can show a percentage and "file X of Y".
+        prog = Progress(on_change=self._on_progress)
+        counts = []
+        for f in folders:
+            try:
+                counts.append(count_files(f["local"], list(DEFAULT_EXCLUDES) + list(f.get("exclude", []))))
+            except OSError:
+                counts.append((0, 0))
+        prog.add_total(sum(n for n, _ in counts), sum(b for _, b in counts))
+        self.progress = prog
+        for f, (n_files, n_bytes) in zip(folders, counts, strict=True):
+            if self.stopping.is_set() or self.paused:
+                break
+            email = self.folder_account(f, known)
+            self.set_state("syncing", "Syncing changes…" if only else "Syncing…", f"{f['local']}  →  {email}")
+            run = activity.new_run(f["local"], email, trigger, f.get("drive_folder", ""))
+            started = time.monotonic()
+            prog.begin_folder(f["local"], n_files, n_bytes)
+            drive = self._drive_for(email, known)
+            if drive is None:
+                totals["errors"] += 1
+                why = ("needs you to sign in again (Settings → Google accounts)" if email in self.needs_signin
+                       else "couldn't connect to Google Drive - will retry")
+                activity.add_item(run, "error", ".", f"Account {email or '(none)'} {why}")
+            else:
+                try:
+                    excludes = list(DEFAULT_EXCLUDES) + list(f.get("exclude", []))
+                    s = sync_folder(drive, f["local"], drive_folder=f.get("drive_folder"),
+                                    drive_folder_id=f.get("drive_folder_id"),
+                                    delete=bool(f.get("delete")), excludes=excludes,
+                                    mode=f.get("mode", "two_way"), progress=prog,
+                                    on_event=lambda kind, rel, msg, r=run: activity.add_item(r, kind, rel, msg))
+                    if s.get("remote_id"):
+                        self.remote_ids[(os.path.normcase(f["local"]), email)] = s["remote_id"]
+                    for k in totals:
+                        totals[k] += s.get(k, 0)
+                except Exception as e:  # noqa: BLE001
+                    log.error("Sync of %s (%s) failed: %s", f["local"], email, e)
+                    totals["errors"] += 1
+                    activity.add_item(run, "error", ".", f"Sync failed: {e}")
+                    if self._is_auth_error(e):
+                        self.drives.pop(email, None)
+                        self.needs_signin.add(email)
+                        self.ui.put(("account",))
+            prog.end_folder()
+            run["duration"] = round(time.monotonic() - started, 1)
+            self._record(run)
+        self.progress = None
+
+        when = time.strftime("%H:%M")
+        changes = sum(totals[k] for k in ("uploaded", "updated", "trashed", "downloaded", "deleted_local",
+                                          "conflicts"))
+        self.last_check = {"ts": time.time(), "trigger": trigger, "folders": len(folders),
+                           "changes": changes, "errors": totals["errors"]}
+        self.ui.put(("last_check",))
+        parts = [(totals["uploaded"], "uploaded"), (totals["updated"], "updated"),
+                 (totals["downloaded"], "downloaded"), (totals["deleted_local"], "to Recycle Bin"),
+                 (totals["trashed"], "to Drive trash"), (totals["conflicts"], "conflicts kept")]
+        summary = ", ".join(f"{n} {label}" for n, label in parts if n)
+        if self.needs_signin:
+            who = ", ".join(sorted(self.needs_signin))
+            self.set_state("error", "Sign in again needed", f"{who} - open Settings → Google accounts")
+            self.notify(f"Sign in again to keep syncing: {who}")
+            return False
+        if totals["errors"]:
+            self.set_state("error", f"{totals['errors']} problem(s) during sync",
+                           f"Last sync {when} - see the Activity tab")
+            self.notify(f"Sync finished with {totals['errors']} problem(s). Open Drive Sync for details.")
+            return False
+        watching = self.watcher.watched
+        live = f" · watching {watching} folder{'s' if watching != 1 else ''} for changes" if watching else ""
+        self.set_state("idle", "Up to date", f"Last sync {when}" + (f" - {summary}" if changes else "") + live)
+        if changes and cfg.get("notify_on_changes"):
+            self.notify(f"Synced: {summary}")
+        return True
+
+    # --------------------------------------------------------------- actions
+    def sync_now(self):
+        self.paused = False
+        self.force_full = True
+        self.wake.set()
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        if self.state != "syncing":
+            self.set_state("idle", "Paused" if self.paused else "Resuming…", "")
+        else:
+            self.ui.put(("state",))
+        if not self.paused:
+            self.wake.set()
+
+    def credentials_ready(self) -> bool:
+        return CREDS_PATH.exists()
+
+    def accounts_info(self) -> list[dict]:
+        known = accounts.list_accounts()
+        counts = {e: 0 for e in known}
+        for f in self.cfg.get("folders", []):
+            acc = self.folder_account(f, known)
+            if acc in counts:
+                counts[acc] += 1
+        for e in known:  # logins from before full Drive access was needed
+            if e not in self.needs_signin and not accounts.has_required_scopes(accounts.token_path(e)):
+                self.needs_signin.add(e)
+        return [{"email": e, "folders": counts[e], "needs_signin": e in self.needs_signin} for e in known]
+
+    def drive_for_browsing(self, email: str) -> Drive:
+        """A separate Drive connection for the folder browser (called from its own thread)."""
+        return Drive(build_service(accounts.load_credentials(email)))
+
+    # ------------------------------------------------------- browser profiles
+    def account_profile(self, email: str | None) -> str | None:
+        """Browser profile chosen for this account ("brave|Profile 7"), or None = default browser."""
+        return (self.cfg.get("account_browsers") or {}).get(email or "") or None
+
+    def set_account_profile(self, email: str, profile_id: str | None) -> None:
+        mapping = dict(self.cfg.get("account_browsers") or {})
+        if profile_id:
+            mapping[email] = profile_id
+        else:
+            mapping.pop(email, None)
+        self.save_config({**self.cfg, "account_browsers": mapping})
+
+    def open_url(self, url: str, email: str | None = None) -> None:
+        """Open a link in the browser profile that belongs to this Google account."""
+        browsers.open_url(url, self.account_profile(email))
+
+    def add_account(self, login_hint: str | None = None, browser_profile: str | None = None):
+        """Open the browser so the user can choose a Google account (runs in the background)."""
+        if self.signing_in or not CREDS_PATH.exists():
+            return
+        self.signing_in = login_hint or "new"
+        self.ui.put(("account",))
+        if browser_profile is None and login_hint:
+            browser_profile = self.account_profile(login_hint)
+        threading.Thread(target=self._sign_in_thread, args=(login_hint, browser_profile), daemon=True).start()
+
+    def _sign_in_thread(self, login_hint: str | None, browser_profile: str | None = None):
+        try:
+            creds = accounts.sign_in(CREDS_PATH, login_hint=login_hint, browser_profile=browser_profile)
+            email = accounts.account_email(build_service(creds))
+            accounts.save_account(email, creds.to_json())
+            self.drives.pop(email, None)
+            self.needs_signin.discard(email)
+            log.info("Google account ready: %s", email)
+            self.record_event("info", f"Signed in: {email}", "Google account is ready to sync")
+            self.ui.put(("account_added", email, browser_profile))
+            self.wake.set()
+        except Exception as e:  # noqa: BLE001 - closed the tab, timed out, denied access, ...
+            log.error("Sign-in didn't finish: %s", e)
+            self.record_event("warning", "Sign-in didn't finish", str(e)[:300])
+            self.ui.put(("error", "Sign-in didn't finish. Try again, and approve access in the browser window "
+                                  f"that opens.\n\nDetails: {e}"))
+        finally:
+            self.signing_in = None
+            self.ui.put(("account",))
+
+    def remove_account(self, email: str):
+        def work():
+            accounts.remove_account(email)
+            self.drives.pop(email, None)
+            self.needs_signin.discard(email)
+            log.info("Removed Google account %s", email)
+            self.record_event("info", f"Removed account: {email}", "Drive Sync's access was revoked")
+            self.ui.put(("account",))
+        threading.Thread(target=work, daemon=True).start()
+
+    def import_credentials(self, path: Path):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
+            raise ValueError(f"Couldn't read that file: {e}") from e
+        if "installed" not in data:
+            raise ValueError("That doesn't look like a Desktop-app OAuth client file.\n"
+                             "In Google Cloud Console create an OAuth client of type “Desktop app” "
+                             "and download its JSON.")
+        if path.resolve() != CREDS_PATH.resolve():
+            shutil.copyfile(path, CREDS_PATH)
+        log.info("Imported OAuth client file")
+        self.record_event("info", "Imported credentials.json")
+
+    def startup_enabled(self) -> bool:
+        return STARTUP_LNK.exists()
+
+    def set_startup(self, enabled: bool):
+        if not enabled:
+            STARTUP_LNK.unlink(missing_ok=True)
+            log.info("Removed from Windows startup")
+            return
+        if getattr(sys, "frozen", False):
+            target, args = sys.executable, "--hidden"
+        else:
+            exe = Path(sys.executable)
+            pyw = exe.with_name("pythonw.exe")
+            target, args = str(pyw if pyw.exists() else exe), f'"{Path(__file__).resolve()}" --hidden'
+        # Values are passed as environment variables, never pasted into the script text.
+        script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:DS_LNK);"
+                  "$s.TargetPath=$env:DS_TARGET;$s.Arguments=$env:DS_ARGS;$s.WorkingDirectory=$env:DS_DIR;"
+                  "$s.Description='Sync folders to Google Drive';$s.Save()")
+        env = dict(os.environ, DS_LNK=str(STARTUP_LNK), DS_TARGET=target, DS_ARGS=args, DS_DIR=str(APP_DIR))
+        subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", script],
+                       env=env, check=True, creationflags=NO_WINDOW, capture_output=True)
+        log.info("Added to Windows startup")
+
+    def open_log(self):
+        LOG_PATH.touch(exist_ok=True)
+        subprocess.Popen([str(NOTEPAD), str(LOG_PATH)])
+
+    def open_readme(self):
+        subprocess.Popen([str(NOTEPAD), str(self.readme_path)])
+
+    def quit(self):
+        log.info("Drive Sync stopped")
+        self.stopping.set()
+        self.wake.set()
+        try:
+            self.watcher.stop()
+            self.icon.stop()
+        finally:
+            self.root.destroy()
+
+    def run(self):
+        self.refresh_watchers()
+        threading.Thread(target=self.worker, daemon=True).start()
+        self.icon.run_detached()
+        self.root.after(150, self.window.poll)
+        self.root.mainloop()
+
+
+# --------------------------------------------------------------------------- #
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Drive Sync desktop app")
+    ap.add_argument("--hidden", action="store_true", help="Start in the system tray without opening the window")
+    args = ap.parse_args()
+
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    logging.getLogger("googleapiclient").setLevel(logging.WARNING)
+    # The sign-in library logs the browser redirect URL, which contains the one-time OAuth code.
+    logging.getLogger("google_auth_oauthlib").setLevel(logging.WARNING)
+
+    if not single_instance():
+        if not args.hidden:
+            SHOW_FLAG.touch()  # ask the running copy to show its window
+        return 0
+    SHOW_FLAG.unlink(missing_ok=True)
+    log.info("Drive Sync started%s", " (in tray)" if args.hidden else "")
+    try:
+        App(start_hidden=args.hidden).run()
+    except Exception:  # noqa: BLE001
+        log.exception("Drive Sync crashed")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
