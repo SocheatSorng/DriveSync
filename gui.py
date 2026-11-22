@@ -14,6 +14,7 @@ import customtkinter as ctk
 import browsers
 import updater
 from activity_view import ActivityView
+from skip_picker import split_patterns
 from space_view import SpaceView
 from version import __version__
 
@@ -118,8 +119,11 @@ class FolderDialog(ctk.CTkToplevel):
 
         label(7, "Skip files or folders matching", pad=16)
         ctk.CTkEntry(f, textvariable=self.exclude, placeholder_text="*.log, node_modules, .git").grid(
-            row=8, column=0, columnspan=2, sticky="ew")
-        label(9, "Comma-separated patterns.", muted=True)
+            row=8, column=0, sticky="ew")
+        ctk.CTkButton(f, text="Choose…", width=100, command=self.choose_skips, **SECONDARY).grid(
+            row=8, column=1, padx=(8, 0))
+        label(9, "Click Choose… to tick files and folders to skip - or type comma-separated patterns.",
+              muted=True)
 
         label(10, "Sync direction", pad=16)
         self.mode = ctk.CTkSegmentedButton(f, values=list(MODES), command=lambda _: self._show_mode())
@@ -187,6 +191,15 @@ class FolderDialog(ctk.CTkToplevel):
             if not self.drive.get():
                 self.drive.set(f"My Drive/PC Backup/{Path(path).name}")
 
+    def choose_skips(self):
+        from drive_sync import DEFAULT_EXCLUDES
+        from skip_picker import SkipPicker
+        picked = SkipPicker(self, self.local.get().strip(), split_patterns(self.exclude.get()),
+                            always=DEFAULT_EXCLUDES).result
+        if picked is not None:
+            self.exclude.set(", ".join(picked))
+        self._grab()
+
     def choose_drive_folder(self):
         email = self.account.get()
         if not email:
@@ -209,7 +222,7 @@ class FolderDialog(ctk.CTkToplevel):
         mode = MODES[self.mode.get()]
         result = {**self.data, "local": local, "account": account, "mode": mode,
                   "delete": self.delete.get() if mode == "upload" else False,
-                  "exclude": [x.strip() for x in self.exclude.get().split(",") if x.strip()]}
+                  "exclude": split_patterns(self.exclude.get())}
         result.pop("drive_folder_id", None)
         if self.drive_id and text == self.chosen_label:
             result["drive_folder_id"] = self.drive_id
