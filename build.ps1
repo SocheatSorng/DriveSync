@@ -6,7 +6,17 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed `
+# Use the project's .venv when there is one: a system Python may have PyInstaller but not the app's
+# packages, and PyInstaller then builds an .exe that crashes at start ("No module named ...").
+$venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+$python = if (Test-Path $venvPython) { $venvPython } else { "python" }
+
+& $python -c "import watchdog, pystray, customtkinter, send2trash, PIL, requests, googleapiclient, google_auth_oauthlib, PyInstaller"
+if ($LASTEXITCODE -ne 0) {
+    throw "$python is missing packages the app needs. Run 'uv sync' (or pip install -r requirements.txt pyinstaller) first."
+}
+
+& $python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name DriveSync `
     --icon assets\drivesync.ico `
     --add-data "README.md;." `
