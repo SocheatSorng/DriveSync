@@ -41,6 +41,24 @@ class DescribeTests(unittest.TestCase):
         self.assertFalse(is_rule("Project/.venv"))
 
 
+class SkipSideTests(unittest.TestCase):
+    """Which side a skip is shown as being on, on the folder card."""
+
+    def test_sides(self):
+        from gui import MainWindow
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "Local only").mkdir()
+            (Path(tmp) / "Both").mkdir()
+            side = lambda p, where={}: MainWindow.skip_side(p, tmp, where)  # noqa: E731
+            self.assertEqual(side("*.log"), "rule")
+            self.assertEqual(side("node_modules"), "rule")
+            self.assertEqual(side("Local only"), "pc")
+            self.assertEqual(side("Both", {"Both": "both"}), "both")
+            self.assertEqual(side("Cloud", {"Cloud": "drive"}), "drive")
+            self.assertEqual(side("Old setting"), "drive")      # saved before sides were recorded
+            self.assertEqual(side("Local only", {"Local only": "drive"}), "both")  # now also on this PC
+
+
 class PickerTests(unittest.TestCase):
     """Drive the real dialog (no screen interaction: actions are scheduled on its event loop)."""
 
@@ -260,6 +278,21 @@ class DrivePickerTests(PickerTests):
         self.assertTrue(any("clip.mp4" in t for t in seen["big"]))
         self.assertTrue(any("Old on Drive" in t and "only on Google Drive" in t for t in seen["project"]))
         self.assertEqual(result, ["Big Drive Only", "report.pdf"])
+
+    def test_records_which_side_each_ticked_item_is_on(self):
+        holder = {}
+
+        def steps(p, seen, wait):
+            def loaded():
+                for rel in ["Big Drive Only", "Project", "Photos [2024]"]:
+                    p.toggle(p.item_of[rel])
+                holder["picker"] = p
+                p.done()
+            wait(loaded)
+
+        self.open_drive([], steps)
+        self.assertEqual(holder["picker"].result_where, {"Big Drive Only": "drive", "Project": "both",
+                                                         pattern_for("Photos [2024]"): "pc"})
 
     def test_reopening_ticks_saved_drive_only_items(self):
         def steps(p, seen, wait):

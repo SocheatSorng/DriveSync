@@ -126,6 +126,7 @@ class FolderDialog(ctk.CTkToplevel):
         self.drive = tk.StringVar(value=shown)
         self.delete = tk.BooleanVar(value=bool(self.data.get("delete")))
         self.exclude = tk.StringVar(value=", ".join(self.data.get("exclude", [])))
+        self.exclude_where: dict[str, str] = dict(self.data.get("exclude_where", {}))  # pattern -> pc/drive/both
         self.account.trace_add("write", lambda *_: self._forget_choice())
 
         f = ctk.CTkFrame(self, fg_color="transparent")
@@ -247,9 +248,10 @@ class FolderDialog(ctk.CTkToplevel):
                 root_id, label = None, f"My Drive/{path}"
             lister = drive_lister(self.app, email, root_id, path)
         picked = SkipPicker(self, local, split_patterns(self.exclude.get()), always=DEFAULT_EXCLUDES,
-                            drive_list=lister, drive_label=label).result
-        if picked is not None:
-            self.exclude.set(", ".join(picked))
+                            drive_list=lister, drive_label=label, where=self.exclude_where)
+        if picked.result is not None:
+            self.exclude.set(", ".join(picked.result))
+            self.exclude_where = picked.result_where
         self._grab()
 
     def choose_drive_folder(self):
@@ -275,6 +277,11 @@ class FolderDialog(ctk.CTkToplevel):
         result = {**self.data, "local": local, "account": account, "mode": mode,
                   "delete": self.delete.get() if mode == "upload" else False,
                   "exclude": split_patterns(self.exclude.get())}
+        where = {p: w for p, w in self.exclude_where.items() if p in result["exclude"]}
+        if where:
+            result["exclude_where"] = where
+        else:
+            result.pop("exclude_where", None)
         result.pop("drive_folder_id", None)
         if self.drive_id and text == self.chosen_label:
             result["drive_folder_id"] = self.drive_id
@@ -779,38 +786,69 @@ class MainWindow:
     SKIP_CHARS = 70     # chips shown on a folder card before "+N more"
     CHIP = {"fg_color": ("#e3e3e3", "#3c4043"), "corner_radius": 8, "height": 22}
 
-    def _skip_row(self, parent, skips: list[str], local: str, on_click):
-        """'Skips  [📁 Big folder] [*.log] [+3 more]': short names, the full list on hover; click to edit."""
-        from skip_picker import describe, is_rule
+    # Where a skipped item is: (badge on its chip, text colour, what skipping it means).
+    SKIP_SIDES = {
+        "pc": ("This PC", None, "On this PC only - it isn't uploaded to Google Drive."),
+        "drive": ("Google Drive", ("#1a73e8", "#8ab4f8"),
+                  "On Google Drive only - it isn't downloaded to this PC."),
+        "both": ("PC + Drive", None, "On this PC and on Google Drive - both copies are left as they are "
+                                     "and no longer kept the same."),
+        "rule": ("Rule", MUTED, "A rule: anything matching it, anywhere in the folder, on this PC or "
+                                "Google Drive, isn't synced."),
+    }
+
+    @staticmethod
+    def skip_side(pattern: str, local: str, where: dict) -> str | None:
+        """Where a skipped item is: "pc", "drive", "both", "rule", or None (not known)."""
+        from skip_picker import COMMON, describe, is_rule
+        if is_rule(pattern) or pattern in {p for p, _ in COMMON}:
+            return "rule"                          # *.log, or a common name like node_modules: anywhere
+        full = describe(pattern)[1]
+        on_pc = os.path.lexists(os.path.join(local, *full.split("/")))
+        saved = where.get(pattern)                 # seen when it was ticked in the picker
+        if saved is None:   # saved before sides were recorded: a picked path not on this PC came from Drive
+            return "pc" if on_pc else "drive"
+        on_drive = saved in ("drive", "both")
+        return "both" if on_pc and on_drive else "drive" if on_drive else "pc" if on_pc else saved
+
+    def _skip_row(self, parent, skips: list[str], local: str, on_click, where: dict | None = None):
+        """'Skips  [Big folder · Google Drive] [*.log · Rule] [+3 more]': short names and which side
+        each is on, the full list on hover; click to edit."""
+        from skip_picker import describe
+        where = where or {}
         row = ctk.CTkFrame(parent, fg_color="transparent")
         ctk.CTkLabel(row, text="Skips", font=font(12), text_color=MUTED).pack(side="left", padx=(0, 6))
         shown, used = [], 0
         for p in skips:
             short, _ = describe(p)
-            if len(short) > 32:
-                short = short[:31] + "…"
-            if shown and used + len(short) > self.SKIP_CHARS:
+            if len(short) > 28:
+                short = short[:27] + "…"
+            side = self.skip_side(p, local, where)
+            badge = self.SKIP_SIDES[side][0] if side else ""
+            if shown and used + len(short) + len(badge) > self.SKIP_CHARS:
                 break
-            shown.append((p, short))
-            used += len(short) + 4
+            shown.append((p, short, side))
+            used += len(short) + len(badge) + 6
         chips = []
-        for p, short in shown:
-            _, full = describe(p)
-            icon = ""     # rules (*.log, node_modules anywhere) and things only on Drive: no icon
-            if not is_rule(p):
-                path = os.path.join(local, *full.split("/"))
-                icon = "📁  " if os.path.isdir(path) else "📄  " if os.path.isfile(path) else ""
-            chip = ctk.CTkLabel(row, text=f"{icon}{short}", font=font(11), **self.CHIP)
+        for p, short, side in shown:
+            full = describe(p)[1]
+            badge, color, meaning = self.SKIP_SIDES[side] if side else ("", None, "Not synced either way.")
+            text = f"{short}  ·  {badge}" if badge else short
+            chip = ctk.CTkLabel(row, text=text, font=font(11), **self.CHIP,
+                                **({"text_color": color} if color else {}))
             chip.pack(side="left", padx=(0, 4), ipadx=6)
-            tip = full if not is_rule(p) else f"{full}  (anything matching this, anywhere in the folder)"
-            Tooltip(chip, tip + "\n\nClick to change what's skipped.")
+            Tooltip(chip, f"{full}\n{meaning}\n\nClick to change what's skipped.")
             chips.append(chip)
         rest = skips[len(shown):]
         if rest:
             more = ctk.CTkLabel(row, text=f"+{len(rest)} more", font=font(11), text_color=("#1a73e8", "#8ab4f8"),
                                 **self.CHIP)
             more.pack(side="left", ipadx=6)
-            Tooltip(more, "\n".join(describe(p)[1] for p in rest) + "\n\nClick to change what's skipped.")
+            lines = []
+            for p in rest:
+                side = self.skip_side(p, local, where)
+                lines.append(describe(p)[1] + (f"   ({self.SKIP_SIDES[side][0]})" if side else ""))
+            Tooltip(more, "\n".join(lines) + "\n\nClick to change what's skipped.")
             chips.append(more)
         for w in chips:
             w.configure(cursor="hand2")
@@ -864,7 +902,8 @@ class MainWindow:
             skips = f.get("exclude") or []
             info.grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 4 if skips else 12))
             if skips:
-                self._skip_row(c, skips, f.get("local", ""), lambda i=i: self.edit_folder(i)).grid(
+                self._skip_row(c, skips, f.get("local", ""), lambda i=i: self.edit_folder(i),
+                               f.get("exclude_where", {})).grid(
                     row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 12))
             btns = ctk.CTkFrame(c, fg_color="transparent")
             btns.grid(row=0, column=1, padx=12, pady=(10, 0))

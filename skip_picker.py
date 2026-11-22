@@ -109,13 +109,18 @@ class SkipPicker(ctk.CTkToplevel):
     drive_list: optional list(folder_id) (see drive_lister) - adds what's on Google Drive to the tree."""
 
     def __init__(self, parent, local: str, patterns: list[str], always: list[str] = (),
-                 drive_list=None, drive_label: str = ""):
+                 drive_list=None, drive_label: str = "", where: dict | None = None):
         super().__init__(parent)
         self.title("Choose what to skip")
         self.geometry("620x640")
         self.minsize(480, 460)
         self.transient(parent)
         self.result = None
+        self.result_where: dict[str, str] = {}        # pattern -> "pc" / "drive" / "both" (where it is)
+        self.where_before = dict(where or {})
+        self.on_pc: set[str] = set()                  # paths seen on this PC
+        self.on_drive: set[str] = set()               # paths seen on Google Drive
+        self.drive_done: set[str] = set()             # folders whose Drive side has loaded
         self.local = local
         self.always = list(always)                    # built-in junk patterns: shown as skipped, not returned
         common_names = {p for p, _ in COMMON}
@@ -278,7 +283,9 @@ class SkipPicker(ctk.CTkToplevel):
                              tags=("note",))
         entries.sort(key=lambda x: (not x[1], x[0].lower()))
         for name, is_dir in entries[:MAX_ROWS]:
-            self._add_row(parent_item, f"{rel_dir}/{name}" if rel_dir else name, is_dir, False)
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            self.on_pc.add(rel)
+            self._add_row(parent_item, rel, is_dir, False)
         if len(entries) > MAX_ROWS:
             self.tree.insert(parent_item, "end", text=f"…and {len(entries) - MAX_ROWS:,} more "
                                                       "(type a pattern in the box to skip those)", tags=("note",))
@@ -325,14 +332,19 @@ class SkipPicker(ctk.CTkToplevel):
             return
         here = {self.rel_of[c].rsplit("/", 1)[-1].lower(): c for c in self.tree.get_children(parent_item)
                 if c in self.rel_of}
+        self.drive_done.add(rel_dir)
         added = 0
         for entry in sorted(out, key=lambda e: (not e["is_dir"], e["name"].lower())):
             rel = f"{rel_dir}/{entry['name']}" if rel_dir else entry["name"]
             if entry["is_dir"]:
                 self.drive_ids.setdefault(rel, entry["id"])
             key = entry["name"].lower()
-            if key in here or added >= MAX_ROWS:
-                continue                               # on both sides (or Drive has two with one name)
+            if key in here:
+                self.on_drive.add(self.rel_of[here[key]])   # on both sides: one row, under the PC's name
+                continue
+            self.on_drive.add(rel)
+            if added >= MAX_ROWS:
+                continue
             here[key] = self._add_row(parent_item, rel, entry["is_dir"], True)
             added += 1
         # Keep folders first, then files, by name.
@@ -423,6 +435,28 @@ class SkipPicker(ctk.CTkToplevel):
         common = [p for p, _ in COMMON if self.common[p].get()]
         return common + sorted(self.paths, key=str.lower) + self.other
 
+    def where_of(self, rel: str) -> str | None:
+        """Where a tree item is: "pc", "drive" or "both" - None while that's not known yet (its
+        folder's Drive side hasn't loaded, or there's no Drive side to look at)."""
+        pc, drive = rel in self.on_pc, rel in self.on_drive
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if pc and drive:
+            return "both"
+        if drive:
+            return "drive"
+        if pc and parent in self.drive_done:
+            return "pc"
+        return None
+
     def done(self):
         self.result = self.result_patterns()
+        for rel, item in self.item_of.items():
+            p = pattern_for(rel)
+            if p in self.paths:
+                w = self.where_of(rel)
+                if w:
+                    self.result_where[p] = w
+        for p in self.result:                          # not shown this time: keep what was known
+            if p not in self.result_where and p in self.where_before:
+                self.result_where[p] = self.where_before[p]
         self.destroy()
