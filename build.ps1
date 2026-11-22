@@ -30,3 +30,22 @@ if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
 $exe = Get-Item dist\DriveSync.exe
 Write-Host ("Built {0} ({1:N1} MB)" -f $exe.FullName, ($exe.Length / 1MB))
+
+# --- Installer (Inno Setup 6): dist\DriveSync-Setup.exe + its SHA-256 (the app checks it before updating)
+$version = (& $python -c "from version import __version__; print(__version__)").Trim()
+$iscc = @(
+    (Get-Command iscc -ErrorAction SilentlyContinue).Source,
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $iscc) {
+    Write-Warning "Inno Setup 6 not found - skipped the installer (DriveSync.exe is still built)."
+    return
+}
+& $iscc /Q "/DAppVersion=$version" installer.iss
+if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+$setup = Get-Item dist\DriveSync-Setup.exe
+$hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+Set-Content -Path "dist\DriveSync-Setup.exe.sha256" -Value "$hash  DriveSync-Setup.exe" -Encoding ascii -NoNewline
+Write-Host ("Built {0} ({1:N1} MB), version {2}" -f $setup.FullName, ($setup.Length / 1MB), $version)

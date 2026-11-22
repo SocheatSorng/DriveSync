@@ -99,6 +99,31 @@ class AnimationTests(unittest.TestCase):
         self.assertNotEqual(tray_app.SYNC_FRAMES[0].tobytes(), tray_app.SYNC_FRAMES[2].tobytes())
 
 
+class RemoveDataTests(unittest.TestCase):
+    def test_remove_data_keeps_everything_else(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "DriveSync"
+            (base / "accounts").mkdir(parents=True)
+            (base / "accounts" / "me@example.com.json").write_text("{}")
+            (base / "state").mkdir()
+            (base / "config.json").write_text("{}")
+            (base / "tray_app.py").write_text("# a copy run from source keeps its code")
+            removed = tray_app.remove_data(base, revoke=False)
+            self.assertEqual(sorted(removed), ["accounts", "config.json", "state"])
+            self.assertEqual([p.name for p in base.iterdir()], ["tray_app.py"])
+
+    def test_empty_folder_is_removed(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "DriveSync"
+            (base / "logs").mkdir(parents=True)
+            tray_app.remove_data(base, revoke=False)
+            self.assertFalse(base.exists())
+
+
 class MeteredTests(unittest.TestCase):
     def test_parse(self):
         self.assertFalse(metered.parse("Unrestricted False False"))

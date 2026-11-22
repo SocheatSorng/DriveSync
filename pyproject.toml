@@ -1,6 +1,6 @@
 [project]
 name = "drive-sync"
-version = "1.0.0"
+version = "1.1.0"
 description = "Keep folders on this PC backed up to Google Drive"
 requires-python = ">=3.10"
 # Exact versions (with hashes) are pinned in uv.lock. After changing this list run:

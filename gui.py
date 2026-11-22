@@ -12,7 +12,10 @@ from urllib.parse import urlencode
 import customtkinter as ctk
 
 import browsers
+import updater
 from activity_view import ActivityView
+from space_view import SpaceView
+from version import __version__
 
 STATE_COLORS = {"idle": "#1a73e8", "syncing": "#f9ab00", "error": "#d93025", "paused": "#80868b"}
 MUTED = ("#5f6368", "#9aa0a6")          # (light, dark)
@@ -506,6 +509,7 @@ class MainWindow:
         self._build_folders(tabs.add("Folders"))
         self._build_settings(tabs.add("Settings"))
         self._build_activity(tabs.add("Activity"))
+        self.space_view = SpaceView(tabs.add("Space"), self.app)
         self.tabs = tabs
         self.built = True
 
@@ -520,7 +524,7 @@ class MainWindow:
         self.built = False
         for w in self.root.winfo_children():
             w.destroy()
-        for attr in ("tabs", "activity_view", "folder_list", "accounts_box", "dot", "status_lbl",
+        for attr in ("tabs", "activity_view", "space_view", "folder_list", "accounts_box", "dot", "status_lbl",
                      "detail_lbl", "pause_btn", "sync_btn", "bar"):
             self.__dict__.pop(attr, None)
         import gc
@@ -638,6 +642,25 @@ class MainWindow:
         metered_help.pack(anchor="w", padx=16, pady=(4, 14), fill="x")
         autowrap(metered_help, net, margin=40)
 
+        upd = card("Updates")
+        self.update_lbl = ctk.CTkLabel(upd, text="", font=font(12), text_color=MUTED, anchor="w", justify="left")
+        self.update_lbl.pack(anchor="w", padx=16)
+        self.auto_update_var = tk.BooleanVar(value=bool(cfg.get("auto_update", True)))
+        ctk.CTkSwitch(upd, text="Install updates automatically", variable=self.auto_update_var,
+                      command=self.save_options, font=font()).pack(anchor="w", padx=16, pady=(8, 0))
+        upd_help = ctk.CTkLabel(upd, text="New versions come from the project's GitHub page. They're installed "
+                                          "when nothing is syncing, and Drive Sync restarts by itself. Your "
+                                          "folders, accounts and settings are kept.",
+                                font=font(12), text_color=MUTED, anchor="w", justify="left")
+        upd_help.pack(anchor="w", padx=16, pady=(4, 6), fill="x")
+        autowrap(upd_help, upd, margin=40)
+        r = ctk.CTkFrame(upd, fg_color="transparent")
+        r.pack(anchor="w", padx=16, pady=(2, 14))
+        ctk.CTkButton(r, text="Check now", width=100, command=self.app.check_updates_now, **SECONDARY).pack(
+            side="left")
+        self.update_btn = ctk.CTkButton(r, text="Update now", width=120, command=self.app.install_update)
+        self.refresh_update()
+
         look = card("Appearance")
         self.theme_btn = ctk.CTkSegmentedButton(look, values=["System", "Light", "Dark"],
                                                 command=self.set_appearance)
@@ -650,6 +673,9 @@ class MainWindow:
                      font=font(12), text_color=MUTED).pack(side="left")
         ctk.CTkButton(bottom, text="Quit Drive Sync", width=130, command=self.confirm_quit, **DANGER).pack(
             side="right")
+        if updater.installed_copy():
+            ctk.CTkButton(bottom, text="Uninstall…", width=100, command=self.app.uninstall, **SECONDARY).pack(
+                side="right", padx=(0, 8))
 
     def _build_activity(self, tab):
         self.activity_view = ActivityView(tab, self.app)
@@ -670,6 +696,20 @@ class MainWindow:
             self.bar.set(prog.percent / 100)
         else:
             self.bar.grid_remove()
+
+    def refresh_update(self):
+        app = self.app
+        where = "installed" if updater.installed_copy() else "not installed with Setup: updates are only shown"
+        status = f"\n{app.update_status}" if app.update_status else ""
+        self.update_lbl.configure(text=f"Version {__version__} ({where}){status}")
+        if app.update and updater.installed_copy():
+            self.update_btn.configure(text=f"Update to {app.update.version}")
+            self.update_btn.pack(side="left", padx=(8, 0))
+        elif app.update:
+            self.update_btn.configure(text="Download page")
+            self.update_btn.pack(side="left", padx=(8, 0))
+        else:
+            self.update_btn.pack_forget()
 
     def refresh_folders(self):
         for w in self.folder_list.winfo_children():
@@ -875,6 +915,7 @@ class MainWindow:
                    drive_poll_seconds=POLLS.get(self.poll_menu.get(), 10),
                    high_priority=self.priority_btn.get() == "High",
                    pause_on_metered=self.metered_var.get(),
+                   auto_update=self.auto_update_var.get(),
                    speed_limit_kbps=LIMITS.get(self.limit_menu.get(), self.app.cfg.get("speed_limit_kbps", 0)))
         if cfg != self.app.cfg:
             self.app.save_config(cfg)
@@ -969,7 +1010,7 @@ class MainWindow:
             while True:
                 msg = self.app.ui.get_nowait()
                 kind = msg[0]
-                if kind in ("state", "activity", "last_check", "account") and not self.built:
+                if kind in ("state", "activity", "last_check", "account", "space", "update") and not self.built:
                     continue  # nothing on screen to update; it's all re-read when the window opens
                 if kind == "state":
                     self.refresh_state()
@@ -979,6 +1020,10 @@ class MainWindow:
                     self.activity_view.refresh_header()
                 elif kind == "account":
                     self.refresh_account()
+                elif kind == "space":
+                    self.space_view.render()
+                elif kind == "update":
+                    self.refresh_update()
                 elif kind == "account_added":
                     self.on_account_added(*msg[1:])
                 elif kind == "error":

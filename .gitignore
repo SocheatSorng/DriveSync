@@ -11,6 +11,11 @@ state/
 logs/
 .show
 *.log
+update.json
+uploads.json
+updates/
+activity.jsonl
+sync_state.json
 
 # --- Python / build output ---
 __pycache__/

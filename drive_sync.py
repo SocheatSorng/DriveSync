@@ -53,6 +53,18 @@ DEFAULT_EXCLUDES = ["desktop.ini", "Thumbs.db", ".DS_Store", "~$*", "*.tmp", "*.
 log = logging.getLogger("drive_sync")
 
 
+# How each Activity entry reads in the log file ("error" is logged where it happens, with the reason).
+EVENT_LOG = {"uploaded": "Uploaded", "updated": "Updated", "moved": "Moved on Drive", "downloaded": "Downloaded",
+             "deleted_local": "To Recycle Bin", "trashed": "To Drive trash", "folder": "Folder",
+             "conflict": "Conflict", "skipped": "Skipped"}
+
+
+def log_event(kind: str, rel: str, message: str | None) -> None:
+    if kind in EVENT_LOG:
+        (log.warning if kind in ("conflict", "skipped") else log.info)(
+            "%-15s %s%s", EVENT_LOG[kind], rel, f"  ({message})" if message else "")
+
+
 class ResumableUploads:
     """Big uploads that were stopped part-way (pause, quit, restart, lost connection): Google's link
     to each one, so the next try carries on where it stopped instead of sending the file again.
@@ -489,7 +501,8 @@ class Syncer(StorageFullMixin):
         return md5
 
     def _act(self, msg: str, fn, *args):
-        log.info("%s%s", "[dry-run] " if self.dry_run else "", msg)
+        if self.dry_run:          # real changes are logged as they happen (_emit)
+            log.info("[dry-run] %s", msg)
         return None if self.dry_run else fn(*args)
 
     def _xfer(self, action: str, rel: str, size: int, fn, *args):
@@ -504,7 +517,9 @@ class Syncer(StorageFullMixin):
                 self.progress.transfer_end()
 
     def _emit(self, kind: str, rel: str, message: str | None = None) -> None:
-        """kind: uploaded | updated | trashed | folder | skipped | error"""
+        """kind: uploaded | updated | moved | trashed | folder | skipped | error"""
+        if not self.dry_run:
+            log_event(kind, rel.replace(os.sep, "/"), message)
         if self.on_event:
             try:
                 self.on_event(kind, rel.replace(os.sep, "/"), message)

@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from downloader import PARALLEL
-from drive_sync import FOLDER_MIME, NotEnoughSpace, StorageFullMixin, md5_of
+from drive_sync import FOLDER_MIME, NotEnoughSpace, StorageFullMixin, log_event, md5_of
 from progress import Paused
 
 DISK_MARGIN = 200 * 1024 * 1024   # keep this much free on the PC's disk after a download
@@ -227,6 +227,7 @@ class TwoWaySyncer(StorageFullMixin):
                                  f"{human_size(free)} free)")
 
     def _emit(self, kind: str, rel: str, message: str | None = None) -> None:
+        log_event(kind, rel, message)
         if self.on_event:
             try:
                 self.on_event(kind, rel, message)

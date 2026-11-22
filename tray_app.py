@@ -19,7 +19,6 @@ import subprocess
 import sys
 import threading
 import time
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import customtkinter as ctk
@@ -30,17 +29,22 @@ import accounts
 import activity
 import browsers
 import logo
+import logs
 import metered
+import updater
 from downloader import PARALLEL
 from downloader import apply_settings as apply_network_settings
 from drive_sync import APP_DIR, DEFAULT_EXCLUDES, RESOURCE_DIR, Drive, build_service, sync_folder
 from progress import Paused, Progress, count_files, human_size
+from version import __version__
 from watcher import ChangeTracker, FolderWatcher
 
 CONFIG_PATH = APP_DIR / "config.json"
 CREDS_PATH = APP_DIR / "credentials.json"
 TOKEN_PATH = APP_DIR / "token.json"
 LOG_PATH = APP_DIR / "logs" / "drive_sync.log"
+UPDATE_STATE = APP_DIR / "update.json"
+RUN_MARKER = logs.RunMarker(APP_DIR / "logs" / "running")
 SHOW_FLAG = APP_DIR / ".show"
 ICO_PATH = RESOURCE_DIR / "assets" / "drivesync.ico"
 STARTUP_LNK = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/Drive Sync.lnk"
@@ -62,6 +66,7 @@ DEFAULT_CONFIG = {
     "speed_limit_kbps": 0,     # cap on Drive Sync's combined speed in KB/s (0 = no limit)
     "notify_on_changes": False,
     "pause_on_metered": False,  # hold syncing on phone hotspots / metered Wi-Fi
+    "auto_update": True,        # install new versions from GitHub Releases by itself (installed copies)
     "appearance": "System",
     "folders": [],
 }
@@ -171,6 +176,10 @@ class App:
         self.pause_until: float | None = None       # time.time() when a timed pause ends (None: until resumed)
         self.metered_held = False                   # waiting: on a metered connection (setting on)
         self.animating = False                      # the tray icon is spinning (TrayAnimation)
+        self.update: updater.Update | None = None   # a newer version on GitHub
+        self.update_status = ""                     # shown in Settings → Updates
+        self.update_wake = threading.Event()        # "Check now"
+        self._update_notified: str | None = None
         self.state, self.status, self.detail = "idle", "Starting…", ""
         self.drives: dict[str, Drive] = {}          # email -> connected Drive (worker thread only)
         self.needs_signin: set[str] = set()         # accounts whose login expired / was revoked
@@ -206,6 +215,7 @@ class App:
         ctk.set_appearance_mode(self.cfg.get("appearance", "System").lower())
         ctk.set_default_color_theme("blue")
         self.root = ctk.CTk()
+        self.root.report_callback_exception = logs.tk_callback_error   # no console: errors go to the log
         if start_hidden:
             self.root.withdraw()
         from gui import MainWindow  # after CTk() exists
@@ -221,6 +231,8 @@ class App:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open Drive Sync", lambda *_: self.ui.put(("show",)), default=True),
             pystray.MenuItem("Sync now", lambda *_: self.sync_now()),
+            pystray.MenuItem(lambda _: f"Update to {self.update.version}" if self.update else "",
+                             lambda *_: self.install_update(), visible=lambda _: self.update is not None),
             pystray.MenuItem("Resume syncing", lambda *_: self.resume(), visible=lambda _: self.paused),
             pystray.MenuItem("Pause syncing", pystray.Menu(
                 *[pystray.MenuItem(label, lambda *_, s=secs: self.pause(s)) for label, secs in PAUSE_CHOICES],
@@ -266,6 +278,9 @@ class App:
     # ----------------------------------------------------------------- state
     def set_state(self, state: str, status: str, detail: str = "") -> None:
         self.state, self.status, self.detail = state, status, detail
+        if state != "syncing" and (state, status, detail) != getattr(self, "_logged_state", None):
+            self._logged_state = (state, status, detail)   # each new status once, not every refresh
+            (log.warning if state == "error" else log.info)("Status: %s%s", status, f" - {detail}" if detail else "")
         try:
             if not self.animating:   # while spinning, the animation thread owns the icon
                 self.icon.icon = self.static_icon()
@@ -340,7 +355,10 @@ class App:
             self._check_metered()
             held = self.paused or self.metered_held
             if not held and time.monotonic() >= next_poll:
-                self._poll_drive()  # marks two-way folders whose Drive account has new changes
+                try:
+                    self._poll_drive()  # marks two-way folders whose Drive account has new changes
+                except Exception:  # noqa: BLE001 - keep the worker alive; it's tried again next time
+                    log.exception("Checking Google Drive for changes failed")
                 next_poll = time.monotonic() + self._poll_interval()
             if not held:
                 if self.force_full or self.resume_full or time.monotonic() >= next_full:
@@ -407,6 +425,86 @@ class App:
                                                    "(Settings → Internet use)")
         else:
             self.set_state("idle", "Resuming…", "")
+
+    # ------------------------------------------------------------------ updates
+    def _set_update_status(self, text: str) -> None:
+        self.update_status = text
+        self.ui.put(("update",))
+
+    def update_loop(self) -> None:
+        """Check GitHub for a newer version a minute after start, then once a day (or on "Check now")."""
+        state = updater.load_state(UPDATE_STATE)
+        self.update_wake.wait(60)
+        while not self.stopping.is_set():
+            manual = self.update_wake.is_set()
+            self.update_wake.clear()
+            if manual or time.time() - state.get("last_check", 0) >= updater.CHECK_EVERY:
+                self._check_for_update(manual)
+                state["last_check"] = time.time()
+                updater.save_state(UPDATE_STATE, state)
+            if self.update and self.cfg.get("auto_update", True) and updater.installed_copy():
+                self._auto_install()
+            self.update_wake.wait(3600)
+
+    def _check_for_update(self, manual: bool) -> None:
+        self._set_update_status("Checking for updates…")
+        try:
+            u = updater.check()
+        except Exception as e:  # noqa: BLE001 - offline etc.: try again later
+            log.info("Couldn't check for updates: %s", e)
+            self._set_update_status("Couldn't check for updates (no internet?) - will try again later")
+            return
+        self.update = u
+        if not u:
+            self._set_update_status(f"Up to date (checked {time.strftime('%H:%M')})")
+            return
+        log.info("Drive Sync %s is available", u.version)
+        auto = self.cfg.get("auto_update", True) and updater.installed_copy()
+        self._set_update_status(f"Version {u.version} is available" + (" - installs when nothing is syncing"
+                                                                        if auto else ""))
+        self.icon.update_menu()
+        if self._update_notified != u.version and not auto:
+            self._update_notified = u.version
+            self.notify(f"Drive Sync {u.version} is available. Right-click the tray icon → Update.")
+
+    def _auto_install(self) -> None:
+        if self.state == "syncing" or self.progress is not None:
+            return          # not in the middle of a sync; the hourly loop tries again
+        self.install_update(auto=True)
+
+    def install_update(self, auto: bool = False) -> None:
+        """Download the new version's installer and run it (it restarts Drive Sync)."""
+        u = self.update
+        if not u:
+            return
+        if not updater.installed_copy():
+            self.open_url(u.page)   # a loose .exe / source copy: show where to get it
+            return
+        if not auto and threading.current_thread() is threading.main_thread():
+            threading.Thread(target=self.install_update, daemon=True).start()
+            return
+        try:
+            self._set_update_status(f"Downloading version {u.version}…")
+            setup = updater.download(u, APP_DIR / "updates",
+                                     on_progress=lambda f: self._set_update_status(
+                                         f"Downloading version {u.version}… {int(f * 100)}%"))
+        except Exception as e:  # noqa: BLE001
+            log.error("Update download failed: %s", e)
+            self._set_update_status(f"Couldn't download the update: {e}")
+            return
+        log.info("Installing Drive Sync %s", u.version)
+        self.notify(f"Updating Drive Sync to {u.version} - it restarts by itself in a moment.")
+        updater.run_installer(setup)
+        self.ui.put(("quit",))
+
+    def uninstall(self) -> None:
+        """Start the uninstaller (installed copies). It closes Drive Sync and asks about your settings."""
+        exe = Path(sys.executable).parent / "unins000.exe"
+        if exe.exists():
+            subprocess.Popen([str(exe)], creationflags=0x00000008, close_fds=True)  # noqa: S603 - DETACHED_PROCESS
+
+    def check_updates_now(self) -> None:
+        self.update_wake.set()
 
     def _retry_delay(self) -> int:
         """Seconds before a failed sync is tried again: soon, unless a side is full (that takes
@@ -639,7 +737,18 @@ class App:
         return isinstance(e, RefreshError) or "invalid_grant" in str(e) or "401" in str(e)
 
     # ------------------------------------------------------------------ sync
-    def sync_all(self, only: set | None = None, trigger: str = "scheduled", full: bool = False,
+    def sync_all(self, *args, **kwargs) -> bool:
+        """One sync round. An unexpected error is logged and shown, and syncing carries on later
+        (it used to end the background thread, so nothing synced until a restart)."""
+        try:
+            return self._sync_all(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Sync stopped by an unexpected error")
+            self.progress = None
+            self.set_state("error", "Sync stopped by an unexpected error", f"{e} - see the log file")
+            return False
+
+    def _sync_all(self, only: set | None = None, trigger: str = "scheduled", full: bool = False,
                  scan: bool = False) -> bool:
         """Sync every folder, or only the folders whose keys are in `only` (changed folders).
 
@@ -996,6 +1105,7 @@ class App:
 
     def quit(self):
         log.info("Drive Sync stopped")
+        RUN_MARKER.stop()
         self.stopping.set()
         self.wake.set()
         try:
@@ -1009,35 +1119,75 @@ class App:
         threading.Thread(target=self.worker, daemon=True).start()
         self.icon.run_detached()
         threading.Thread(target=self.animate, daemon=True, name="tray-animation").start()
+        threading.Thread(target=self.update_loop, daemon=True, name="updates").start()
+        if getattr(sys, "frozen", False) and self.startup_enabled():
+            # Point the Windows-startup shortcut at this copy (e.g. after moving to the installed one).
+            threading.Thread(target=self.set_startup, args=(True,), daemon=True).start()
         self.root.after(150, self.window.poll)
         self.root.mainloop()
 
 
 # --------------------------------------------------------------------------- #
+# Everything Drive Sync keeps about you (APP_DIR): removed by --remove-data (the uninstaller's option).
+DATA_ITEMS = ["accounts", "config.json", "config.tmp", "credentials.json", "token.json", "state", "logs",
+              "activity.jsonl", "sync_state.json", "update.json", "uploads.json", "updates", ".show"]
+
+
+def remove_data(base: Path = APP_DIR, revoke: bool = True) -> list[str]:
+    """Sign out every Google account (revoking Drive Sync's access) and delete settings, logins, logs
+    and sync history. Synced files on this PC and on Google Drive aren't touched. Returns what was removed."""
+    removed = []
+    for email in accounts.list_accounts(base / "accounts"):
+        try:
+            accounts.remove_account(email, base / "accounts", revoke=revoke)
+        except Exception as e:  # noqa: BLE001 - deleting the files below still signs it out on this PC
+            log.warning("Couldn't sign out %s: %s", email, e)
+    for name in DATA_ITEMS:
+        p = base / name
+        try:
+            if p.is_dir():
+                shutil.rmtree(p)
+            elif p.exists():
+                p.unlink()
+            else:
+                continue
+            removed.append(name)
+        except OSError as e:
+            log.warning("Couldn't delete %s: %s", p, e)
+    try:
+        base.rmdir()      # only if nothing else is left (e.g. a copy run from source keeps its code)
+    except OSError:
+        pass
+    return removed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Drive Sync desktop app")
     ap.add_argument("--hidden", action="store_true", help="Start in the system tray without opening the window")
+    ap.add_argument("--remove-data", action="store_true",
+                    help="Sign out of Google and delete settings, logins and sync history, then exit (uninstall)")
     args = ap.parse_args()
-
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
-    logging.getLogger("googleapiclient").setLevel(logging.WARNING)
-    # The sign-in library logs the browser redirect URL, which contains the one-time OAuth code.
-    logging.getLogger("google_auth_oauthlib").setLevel(logging.WARNING)
+    if args.remove_data:
+        remove_data()
+        return 0
 
     if not single_instance():
         if not args.hidden:
             SHOW_FLAG.touch()  # ask the running copy to show its window
-        return 0
+        return 0              # (no logging here: only the running copy writes the log file)
+    logs.setup(LOG_PATH)
+    logs.install_crash_hooks()
     SHOW_FLAG.unlink(missing_ok=True)
-    log.info("Drive Sync started%s", " (in tray)" if args.hidden else "")
+    log.info("Drive Sync %s started%s (process %d, %s)", __version__, " in the tray" if args.hidden else "",
+             os.getpid(), sys.executable if getattr(sys, "frozen", False) else "from source")
+    RUN_MARKER.start()
     try:
         App(start_hidden=args.hidden).run()
     except Exception:  # noqa: BLE001
         log.exception("Drive Sync crashed")
         return 1
+    finally:
+        logging.shutdown()
     return 0
 
 
