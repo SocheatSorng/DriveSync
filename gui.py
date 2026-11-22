@@ -51,6 +51,47 @@ def font(size=13, weight="normal"):
     return ctk.CTkFont(family="Segoe UI", size=size, weight=weight)
 
 
+class Tooltip:
+    """A small note that appears while the mouse is over a widget."""
+
+    def __init__(self, widget, text: str, delay: int = 400):
+        self.widget, self.text, self.delay = widget, text, delay
+        self.tip = None
+        self.job = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<Button-1>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self.job = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self.job:
+            self.widget.after_cancel(self.job)
+            self.job = None
+
+    def _show(self):
+        if self.tip or not self.widget.winfo_exists():
+            return
+        x = self.widget.winfo_rootx()
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.attributes("-topmost", True)
+        tk.Label(tw, text=self.text, justify="left", background="#3c4043", foreground="#ffffff",
+                 font=("Segoe UI", 9), padx=8, pady=5, wraplength=480).pack()
+        tw.update_idletasks()
+        x = min(x, tw.winfo_screenwidth() - tw.winfo_width() - 8)
+        tw.wm_geometry(f"+{max(x, 0)}+{y}")
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
 # --------------------------------------------------------------------------- #
 def _strip_my_drive(path: str) -> str:
     """'My Drive/School/2026' -> 'School/2026' (typed paths are always inside My Drive)."""
@@ -735,6 +776,47 @@ class MainWindow:
         else:
             self.update_btn.pack_forget()
 
+    SKIP_CHARS = 70     # chips shown on a folder card before "+N more"
+    CHIP = {"fg_color": ("#e3e3e3", "#3c4043"), "corner_radius": 8, "height": 22}
+
+    def _skip_row(self, parent, skips: list[str], local: str, on_click):
+        """'Skips  [📁 Big folder] [*.log] [+3 more]': short names, the full list on hover; click to edit."""
+        from skip_picker import describe, is_rule
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        ctk.CTkLabel(row, text="Skips", font=font(12), text_color=MUTED).pack(side="left", padx=(0, 6))
+        shown, used = [], 0
+        for p in skips:
+            short, _ = describe(p)
+            if len(short) > 32:
+                short = short[:31] + "…"
+            if shown and used + len(short) > self.SKIP_CHARS:
+                break
+            shown.append((p, short))
+            used += len(short) + 4
+        chips = []
+        for p, short in shown:
+            _, full = describe(p)
+            icon = ""     # rules (*.log, node_modules anywhere) and things only on Drive: no icon
+            if not is_rule(p):
+                path = os.path.join(local, *full.split("/"))
+                icon = "📁  " if os.path.isdir(path) else "📄  " if os.path.isfile(path) else ""
+            chip = ctk.CTkLabel(row, text=f"{icon}{short}", font=font(11), **self.CHIP)
+            chip.pack(side="left", padx=(0, 4), ipadx=6)
+            tip = full if not is_rule(p) else f"{full}  (anything matching this, anywhere in the folder)"
+            Tooltip(chip, tip + "\n\nClick to change what's skipped.")
+            chips.append(chip)
+        rest = skips[len(shown):]
+        if rest:
+            more = ctk.CTkLabel(row, text=f"+{len(rest)} more", font=font(11), text_color=("#1a73e8", "#8ab4f8"),
+                                **self.CHIP)
+            more.pack(side="left", ipadx=6)
+            Tooltip(more, "\n".join(describe(p)[1] for p in rest) + "\n\nClick to change what's skipped.")
+            chips.append(more)
+        for w in chips:
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>", lambda _e: on_click())
+        return row
+
     def refresh_folders(self):
         for w in self.folder_list.winfo_children():
             w.destroy()
@@ -764,8 +846,6 @@ class MainWindow:
                 extra = " · two-way"
             else:
                 extra = " · upload only" + (", Drive matches PC" if f.get("delete") else "")
-            if f.get("exclude"):
-                extra += f" · skips {', '.join(f['exclude'])}"
             exists = os.path.isdir(f.get("local", ""))
             email = self.app.folder_account(f, known)
             if not exists:
@@ -781,7 +861,11 @@ class MainWindow:
                 line, color = f"{arrow}  {email} · {target}{extra}", MUTED
             info = ctk.CTkLabel(c, text=line, font=font(12), text_color=color, anchor="w", justify="left")
             # Full card width under the buttons, wrapping to the window's width.
-            info.grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 12))
+            skips = f.get("exclude") or []
+            info.grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 4 if skips else 12))
+            if skips:
+                self._skip_row(c, skips, f.get("local", ""), lambda i=i: self.edit_folder(i)).grid(
+                    row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 12))
             btns = ctk.CTkFrame(c, fg_color="transparent")
             btns.grid(row=0, column=1, padx=12, pady=(10, 0))
             autowrap(info, c, margin=40)

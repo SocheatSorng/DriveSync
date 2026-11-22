@@ -28,6 +28,19 @@ class PatternTests(unittest.TestCase):
         self.assertFalse(skipped([pattern_for("Project/.venv")], "Other/.venv"))
 
 
+class DescribeTests(unittest.TestCase):
+    def test_picked_paths_read_as_names(self):
+        from skip_picker import describe, is_rule
+        self.assertEqual(describe(pattern_for("Project/Photos [2024]")), ("Photos [2024]", "Project/Photos [2024]"))
+        self.assertEqual(describe(pattern_for("a*b/c?.txt")), ("c?.txt", "a*b/c?.txt"))
+        self.assertEqual(describe("node_modules"), ("node_modules", "node_modules"))
+        self.assertEqual(describe("*.log"), ("*.log", "*.log"))
+        self.assertTrue(is_rule("*.log"))
+        self.assertTrue(is_rule("Thumbs[0-9].db"))
+        self.assertFalse(is_rule(pattern_for("Photos [2024]")))
+        self.assertFalse(is_rule("Project/.venv"))
+
+
 class PickerTests(unittest.TestCase):
     """Drive the real dialog (no screen interaction: actions are scheduled on its event loop)."""
 

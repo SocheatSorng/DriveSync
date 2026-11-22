@@ -11,6 +11,7 @@ import fnmatch
 import glob
 import os
 import queue
+import re
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -52,6 +53,19 @@ def pattern_for(rel: str) -> str:
 
 def split_patterns(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def is_rule(pattern: str) -> bool:
+    """A wildcard rule like *.log (rather than one picked file/folder)?"""
+    return any(c in "*?[" for c in re.sub(r"\[[*?\[]\]", "", pattern))
+
+
+def describe(pattern: str) -> tuple[str, str]:
+    """(short, full) text to show for a skip pattern: escapes undone, a path shortened to its name."""
+    if is_rule(pattern):
+        return pattern, pattern
+    full = re.sub(r"\[([*?\[])\]", r"\1", pattern)
+    return full.rsplit("/", 1)[-1], full
 
 
 def drive_lister(app, email: str, root_id: str | None, path: str):
