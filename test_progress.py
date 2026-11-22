@@ -42,17 +42,37 @@ class ProgressTests(unittest.TestCase):
             p.file_done(1024)
         self.assertEqual(p.percent, 99)
 
-    def test_never_goes_backwards_or_shows_100_before_the_end(self):
+    def test_follows_a_growing_total_and_never_shows_100_before_the_end(self):
         p = Progress()
         p.add_total(2)
         p.file_done()
         self.assertEqual(p.percent, 50)
         p.add_total(2)                                        # two-way found more files on Drive
-        self.assertEqual(p.percent, 50)                       # not 25
+        self.assertEqual(p.percent, 25)                       # the true figure, not a stuck 50
         p.file_done()
         p.file_done()
         p.file_done()
         self.assertEqual(p.percent, 99)                       # 100% is shown as "Up to date"
+
+    def test_quick_sync_that_finds_a_big_new_folder_is_not_stuck_at_99(self):
+        p = Progress()
+        p.add_total(1, 100)          # the first folder it looks at
+        p.file_done(100)
+        self.assertEqual(p.percent, 99)
+        p.add_total(7482, 7482 * 100)  # then a big new folder: 7,483 files in all
+        for _ in range(854):
+            p.file_done(100)
+        self.assertEqual(p.counter(), "file 856 of 7,483")
+        self.assertEqual(p.percent, 11)
+
+    def test_same_total_does_not_flicker_back(self):
+        p = Progress()
+        p.add_total(2, 200)
+        p.transfer("upload", "a", 100)
+        p.transfer_fraction(0.9)
+        self.assertEqual(p.percent, 45)
+        p.transfer_end()                                      # finished, before file_done is counted
+        self.assertEqual(p.percent, 45)
 
     def test_speed_and_time_left_on_a_slow_connection(self):
         t = [0.0]

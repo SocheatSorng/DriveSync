@@ -517,19 +517,50 @@ class TwoWaySyncer(StorageFullMixin):
         return False
 
     def _remote_has_new(self, folder_id: str, rel: str) -> bool:
-        """Anything in this Drive folder that wasn't there (or was different) at the last sync?"""
-        for item in self.drive.list_children(folder_id):
-            r = _join(rel, item["name"])
-            if self._excluded(item["name"], r):
-                continue
-            if item["mimeType"] == FOLDER_MIME:
-                if r not in self.base or self._remote_has_new(item["id"], r):
-                    return True
-            elif "md5Checksum" not in item:
-                return True  # a Google Doc etc. lives here - don't trash it with the folder
-            elif (self.base.get(r) or {}).get("md5") != item["md5Checksum"]:
-                return True
-        return False
+        """Anything in this Drive folder that wasn't there (or was different) at the last sync?
+
+        Looked at level by level, asking about up to 50 folders per request: a deleted folder with
+        thousands of subfolders (e.g. a Python .venv) took one request each - many minutes with the
+        status stuck at "Checking files"."""
+        level = {folder_id: rel}            # Drive folder id -> its path
+        seen = 0
+        try:
+            while level:
+                seen += len(level)
+                if self.progress:
+                    name = rel.rsplit("/", 1)[-1]
+                    self.progress.read_start(f"“{name}” on Google Drive (deleted on this PC) · {seen:,} folders")
+                items = self._children_of(list(level))
+                nxt = {}
+                for item in items:
+                    r = _join(level[item["_parent"]], item["name"])
+                    if self._excluded(item["name"], r):
+                        continue
+                    if item["mimeType"] == FOLDER_MIME:
+                        if r not in self.base:
+                            return True
+                        nxt[item["id"]] = r
+                    elif "md5Checksum" not in item:
+                        return True  # a Google Doc etc. lives here - don't trash it with the folder
+                    elif (self.base.get(r) or {}).get("md5") != item["md5Checksum"]:
+                        return True
+                level = nxt
+            return False
+        finally:
+            if self.progress:
+                self.progress.read_end()
+
+    def _children_of(self, folder_ids: list[str]) -> list[dict]:
+        """Items in these Drive folders, each marked with "_parent" (which of them it's in)."""
+        wanted = set(folder_ids)
+        if hasattr(self.drive, "list_children_of"):
+            out = []
+            for item in self.drive.list_children_of(folder_ids):
+                parent = next((p for p in item.get("parents", ()) if p in wanted), None)
+                if parent:
+                    out.append({**item, "_parent": parent})
+            return out
+        return [{**item, "_parent": f} for f in folder_ids for item in self.drive.list_children(f)]
 
     # -- files ------------------------------------------------------------------------
     def _file(self, L, R, B, rel, path: Path, remote_id: str) -> None:

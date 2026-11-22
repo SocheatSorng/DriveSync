@@ -1010,7 +1010,8 @@ class MainWindow:
             while True:
                 msg = self.app.ui.get_nowait()
                 kind = msg[0]
-                if kind in ("state", "activity", "last_check", "account", "space", "update") and not self.built:
+                if (kind in ("state", "activity", "last_check", "account", "space", "space_progress", "update")
+                        and not self.built):
                     continue  # nothing on screen to update; it's all re-read when the window opens
                 if kind == "state":
                     self.refresh_state()
@@ -1022,6 +1023,8 @@ class MainWindow:
                     self.refresh_account()
                 elif kind == "space":
                     self.space_view.render()
+                elif kind == "space_progress":
+                    self.space_view.show_progress()
                 elif kind == "update":
                     self.refresh_update()
                 elif kind == "account_added":

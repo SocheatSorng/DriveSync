@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -38,6 +39,7 @@ class SpaceState:
         self.selected: set[str] = set()         # items to move to the Recycle Bin / Drive trash
         self.old_selected: set[str] = set()     # Drive files whose old versions to remove
         self.status = ""
+        self.progress = ""                      # short text for the busy button, e.g. "Moved 1,200 of 5,504…"
         self.busy = False
         self.stop = threading.Event()
         self.email: str | None = None           # account of a Drive report
@@ -163,10 +165,9 @@ class SpaceView:
         c = self.card(r.title if r.where == "drive" else "This PC", "\n".join(lines))
         row = ctk.CTkFrame(c, fg_color="transparent")
         row.pack(anchor="w", padx=16, pady=(4, 14))
-        n, size = self._selection()
-        self.delete_btn = ctk.CTkButton(row, text=self._delete_text(n, size, bin_name), width=280,
-                                        state="normal" if n else "disabled", command=self.delete_selected)
+        self.delete_btn = ctk.CTkButton(row, text="", width=280, command=self.delete_selected)
         self.delete_btn.pack(side="left")
+        self._refresh_button()
         if r.where == "drive" and r.trash:
             ctk.CTkButton(row, text=f"Drive's trash uses {human_size(r.trash)} - open it", width=230,
                           command=lambda: self.app.open_url("https://drive.google.com/drive/trash", st_email(self)),
@@ -182,10 +183,7 @@ class SpaceView:
         return f"Move {n:,} selected ({human_size(size)}) to {bin_name}" if n else "Nothing selected"
 
     def _selection(self) -> tuple[int, int]:
-        r = self.st.report
-        sizes = {}
-        for it in [*r.safe(), *r.biggest_files, *(i for g in r.duplicates for i in g.items)]:
-            sizes[it.key] = it.extra.get("used", it.size) if r.where == "drive" else it.size
+        sizes = self._sizes()
         keys = self.st.selected & set(sizes)
         return len(keys), sum(sizes[k] for k in keys)
 
@@ -203,15 +201,28 @@ class SpaceView:
             else:
                 self._refresh_old_button()
         cb = ctk.CTkCheckBox(parent, text=label, variable=var, command=toggle, font=font(12),
-                             checkbox_width=18, checkbox_height=18)
+                             checkbox_width=18, checkbox_height=18,
+                             state="disabled" if self.st.busy else "normal")
         cb.pack(anchor="w", padx=16, pady=1)
         return cb
 
     def _refresh_button(self):
-        r = self.st.report
+        st, r = self.st, self.st.report
+        if st.busy:   # a move is running: say so on the button, and don't let it start a second one
+            self.delete_btn.configure(text=st.progress or "Working…", state="disabled")
+            return
         n, size = self._selection()
         self.delete_btn.configure(text=self._delete_text(n, size, "Recycle Bin" if r.where == "pc" else "Drive trash"),
                                   state="normal" if n else "disabled")
+
+    def show_progress(self):
+        """Cheap update while moving files (redrawing every list would be slow)."""
+        self.status.configure(text=self.st.status)
+        if self.st.report is not None and getattr(self, "delete_btn", None) is not None:
+            try:
+                self._refresh_button()
+            except Exception:  # noqa: BLE001 - the button was just destroyed by a redraw
+                pass
 
     def _safe(self, r: space.Report):
         items = r.safe()
@@ -251,7 +262,8 @@ class SpaceView:
             self._check(c, it, f"{human_size(it.size):>9}   {short(it.path, 80)}", self.st.old_selected)
         n = len(self.st.old_selected)
         self.old_btn = ctk.CTkButton(c, text=self._old_text(), width=280, fg_color=RED, hover_color="#b3261e",
-                                     state="normal" if n else "disabled", command=self.delete_old_versions)
+                                     state="normal" if n and not self.st.busy else "disabled",
+                                     command=self.delete_old_versions)
         self.old_btn.pack(anchor="w", padx=16, pady=(8, 14))
 
     def _old_text(self):
@@ -259,7 +271,8 @@ class SpaceView:
         return f"Remove old versions of {n} file{'s' if n != 1 else ''}" if n else "Select files to remove old versions"
 
     def _refresh_old_button(self):
-        self.old_btn.configure(text=self._old_text(), state="normal" if self.st.old_selected else "disabled")
+        self.old_btn.configure(text=self._old_text(),
+                               state="normal" if self.st.old_selected and not self.st.busy else "disabled")
 
     def _biggest(self, title, items, r: space.Report, select: bool):
         if not items:
@@ -299,6 +312,8 @@ class SpaceView:
 
     def delete_selected(self):
         st, r = self.st, self.st.report
+        if st.busy or r is None:
+            return
         n, size = self._selection()
         bin_name = "Recycle Bin" if r.where == "pc" else "Drive trash"
         whole = sum(1 for g in r.duplicates if all(i.key in st.selected for i in g.items))
@@ -308,30 +323,53 @@ class SpaceView:
                                    f"You can restore them from the {bin_name}.{warn}",
                                    icon="warning" if whole else "question", parent=self.list.winfo_toplevel()):
             return
-        keys = set(st.selected)
-        st.busy, st.status = True, f"Moving {n:,} item(s) to the {bin_name}…"
+        keys = set(st.selected) & set(self._sizes())
+        st.busy, st.progress = True, f"Moving 0 of {len(keys):,}…"
+        st.status = f"Moving {len(keys):,} item(s) to the {bin_name}… This can take a few minutes."
         self.render()
-        threading.Thread(target=self._delete_thread, args=(keys,), daemon=True).start()
+        threading.Thread(target=self._delete_thread, args=(keys,), daemon=True, name="space-delete").start()
+
+    def _sizes(self) -> dict[str, int]:
+        r = self.st.report
+        return {it.key: it.extra.get("used", it.size) if r.where == "drive" else it.size
+                for it in [*r.safe(), *r.biggest_files, *(i for g in r.duplicates for i in g.items)]}
 
     def _delete_thread(self, keys: set[str]):
         st, r, app = self.st, self.st.report, self.app
         done, failed = set(), 0
+        bin_name = "Recycle Bin" if r.where == "pc" else "Drive trash"
+        last = 0.0
+
+        def progress(i):
+            nonlocal last
+            now = time.monotonic()
+            if now - last >= 0.3 or i == len(keys):
+                last = now
+                st.progress = f"Moving {i:,} of {len(keys):,}…"
+                st.status = (f"Moving {len(keys):,} item(s) to the {bin_name}: {i:,} done"
+                             + (f", {failed:,} couldn't be moved" if failed else "") + "…")
+                app.ui.put(("space_progress",))
         try:
             if r.where == "pc":
                 from send2trash import send2trash
-                for k in keys:
-                    try:
-                        send2trash(k)
+                for i, k in enumerate(keys, 1):
+                    if not os.path.lexists(k):   # already gone (moved or deleted elsewhere): nothing to do
                         done.add(k)
-                        space.log.info("Space: to Recycle Bin   %s", k)
-                    except Exception as e:  # noqa: BLE001 - e.g. already gone or open in another app
-                        failed += 1
-                        space.log.warning("Space: couldn't move %s to the Recycle Bin: %s", k, e)
+                        space.log.info("Space: already gone      %s", k)
+                    else:
+                        try:
+                            send2trash(k)
+                            done.add(k)
+                            space.log.info("Space: to Recycle Bin   %s", k)
+                        except Exception as e:  # noqa: BLE001 - e.g. open in another app
+                            failed += 1
+                            space.log.warning("Space: couldn't move %s to the Recycle Bin: %s", k, e)
+                    progress(i)
             else:
                 drive = app.drive_for_browsing(st.email)
                 found = [*r.junk, *r.biggest_files, *(i for g in r.duplicates for i in g.items)]
                 names = {it.key: it.path for it in found}
-                for k in keys:
+                for i, k in enumerate(keys, 1):
                     try:
                         drive.trash(k)
                         done.add(k)
@@ -339,6 +377,7 @@ class SpaceView:
                     except Exception as e:  # noqa: BLE001
                         failed += 1
                         space.log.warning("Space: couldn't move %s to the Drive trash: %s", names.get(k, k), e)
+                    progress(i)
         except Exception as e:  # noqa: BLE001
             failed += len(keys) - len(done)
             space.log.error("Clearing space failed: %s", e)
@@ -347,11 +386,13 @@ class SpaceView:
         st.status = (f"Moved {len(done):,} item(s) ({human_size(freed)}) to the "
                      f"{'Recycle Bin' if r.where == 'pc' else 'Drive trash'}."
                      + (f" {failed} couldn't be moved (open in another app, or already gone)." if failed else ""))
-        st.busy = False
+        st.busy, st.progress = False, ""
         app.ui.put(("space",))
 
     def delete_old_versions(self):
         st, r = self.st, self.st.report
+        if st.busy or r is None:
+            return
         items = [it for it in r.old_versions if it.key in st.old_selected]
         size = sum(it.size for it in items)
         if not messagebox.askyesno("Drive Sync", f"Remove the old versions of {len(items)} file(s)? "

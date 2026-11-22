@@ -99,6 +99,49 @@ class TwoWayMoveTests(unittest.TestCase):
         self.check_same()
 
 
+class BatchDrive(TwoWayFakeDrive):
+    """A fake Drive that can list many folders in one request, like the real one."""
+
+    def list_children_of(self, ids):
+        self.batches = getattr(self, "batches", 0) + 1
+        return [{**c, "parents": [f]} for f in ids for c in self.list_children(f)]
+
+
+class DeletedFolderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pc = Path(self.tmp.name) / "pc"
+        deep = self.pc / "Project" / ".venv" / "Lib" / "site-packages"
+        for i in range(30):                                   # a .venv-like tree: many small folders
+            (deep / f"pkg{i}" / "sub").mkdir(parents=True)
+            (deep / f"pkg{i}" / "sub" / "m.py").write_text(f"# {i}")
+        self.drive = BatchDrive()
+        self.state = Path(self.tmp.name) / "s.json"
+        self.sync()
+
+    def sync(self):
+        return TwoWaySyncer(self.drive, self.pc, "root", excludes=DEFAULT_EXCLUDES, state_path=self.state,
+                            recycle=lambda p: None).run()
+
+    def test_deleted_folder_is_checked_in_a_few_requests_and_trashed(self):
+        shutil.rmtree(self.pc / "Project")
+        self.drive.batches = 0
+        s = self.sync()
+        self.assertEqual(s["trashed"], 1)
+        self.assertLessEqual(self.drive.batches, 6)            # one per level, not one per folder (90+)
+        self.assertEqual(self.drive.tree(), {})
+
+    def test_deleted_folder_with_something_new_on_drive_is_kept(self):
+        shutil.rmtree(self.pc / "Project")
+        self.drive.web_add("Project/.venv/Lib/site-packages/pkg7/sub", "new.txt", "added on Drive")
+        s = self.sync()
+        # The folder stays (it has something new); the files deleted on this PC go to the Drive trash.
+        self.assertEqual((s["trashed"], s["downloaded"]), (30, 1))
+        self.assertTrue((self.pc / "Project/.venv/Lib/site-packages/pkg7/sub/new.txt").exists())
+        self.assertIn("Project/.venv/Lib/site-packages/pkg7/sub/new.txt", self.drive.tree())
+
+
 class UploadOnlyMoveTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -75,7 +75,8 @@ class Progress:
         self._folder_start_bytes = self._folder_bytes = 0
         self.active: dict[str, dict] = {}  # transfers in progress (several downloads run at once)
         self._last = ""         # most recent transfer started (uploads report a fraction for it)
-        self._shown = 0         # never let the shown percentage go backwards
+        self._shown = 0         # shown percentage: doesn't flicker back while the total stays the same
+        self._shown_for = (0, 0)  # (files, bytes) total it was worked out for
         self._last_emit = 0.0
 
     # -- called by the app --------------------------------------------------------
@@ -177,7 +178,15 @@ class Progress:
                 raw = int(100 * (self.done + part) / self.total)
             else:
                 return 0
-            self._shown = max(self._shown, min(99, raw))  # 100 only once the sync has finished
+            raw = min(99, raw)       # 100 only once the sync has finished
+            totals = (self.total, self.total_bytes)
+            if totals != self._shown_for:
+                # More to do was found (a quick sync counts each folder as it gets there, two-way adds
+                # files found only on Drive): show the true figure, even if it's lower than before.
+                # Holding the old, higher number is how "99%" stuck at file 855 of 7,483.
+                self._shown, self._shown_for = raw, totals
+            else:
+                self._shown = max(self._shown, raw)   # same total: never jitter backwards
             return self._shown
 
     def speed(self) -> float | None:
@@ -199,7 +208,7 @@ class Progress:
 
         if not active:
             reading = self.reading
-            return f"Checking {short(reading)}" if reading else "Checking files"
+            return f"Checking {short(reading, 100)}" if reading else "Checking files"
 
         if len(active) > 1:   # the files themselves are listed by file_lines()
             rate = self.speed()

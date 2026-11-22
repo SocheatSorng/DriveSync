@@ -194,6 +194,15 @@ class Drive:
             return []
         return self._list(f"'{_q(folder_id)}' in parents and trashed = false", self.FIELDS)
 
+    def list_children_of(self, folder_ids: list[str]) -> list[dict]:
+        """What's in several folders at once (one request per 50 folders), each item with its "parents"."""
+        out = []
+        for i in range(0, len(folder_ids), 50):
+            ids = folder_ids[i:i + 50]
+            q = "(" + " or ".join(f"'{_q(f)}' in parents" for f in ids) + ") and trashed = false"
+            out += self._list(q, self.FIELDS + ", parents")
+        return out
+
     def find_folder(self, name: str, parent_id: str) -> str | None:
         found = self._list(f"name = '{_q(name)}' and mimeType = '{FOLDER_MIME}' "
                            f"and '{_q(parent_id)}' in parents and trashed = false", "id", page_size=1, limit=1)
