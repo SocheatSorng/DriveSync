@@ -193,9 +193,20 @@ class FolderDialog(ctk.CTkToplevel):
 
     def choose_skips(self):
         from drive_sync import DEFAULT_EXCLUDES
-        from skip_picker import SkipPicker
-        picked = SkipPicker(self, self.local.get().strip(), split_patterns(self.exclude.get()),
-                            always=DEFAULT_EXCLUDES).result
+        from skip_picker import SkipPicker, drive_lister
+        local = self.local.get().strip()
+        email = self.account.get()
+        lister, label = None, ""
+        if email:   # also show what's on Google Drive, so things only there can be kept off this PC
+            text = self.drive.get().strip()
+            if self.drive_id and text == self.chosen_label:
+                root_id, path, label = self.drive_id, "", self.chosen_label
+            else:
+                path = _strip_my_drive(text) or f"PC Backup/{Path(local).name}"
+                root_id, label = None, f"My Drive/{path}"
+            lister = drive_lister(self.app, email, root_id, path)
+        picked = SkipPicker(self, local, split_patterns(self.exclude.get()), always=DEFAULT_EXCLUDES,
+                            drive_list=lister, drive_label=label).result
         if picked is not None:
             self.exclude.set(", ".join(picked))
         self._grab()

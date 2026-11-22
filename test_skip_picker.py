@@ -3,7 +3,10 @@ import types
 import unittest
 from pathlib import Path
 
+from drive_sync import DEFAULT_EXCLUDES, FOLDER_MIME
 from skip_picker import pattern_for, split_patterns
+from test_twoway import FakeDrive as TwoWayFakeDrive
+from test_twoway import local_tree
 from twoway import TwoWaySyncer
 
 
@@ -28,8 +31,19 @@ class PatternTests(unittest.TestCase):
 class PickerTests(unittest.TestCase):
     """Drive the real dialog (no screen interaction: actions are scheduled on its event loop)."""
 
-    def setUp(self):
+    _root = None
+
+    @classmethod
+    def shared_root(cls):
+        # One Tk for all these tests: starting Tk over and over in one process sometimes fails on
+        # Windows ("Can't find a usable tk.tcl").
         import customtkinter as ctk
+        if PickerTests._root is None:
+            PickerTests._root = ctk.CTk()
+            PickerTests._root.withdraw()
+        return PickerTests._root
+
+    def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
@@ -37,9 +51,7 @@ class PickerTests(unittest.TestCase):
                     "Project/node_modules/m.js", "Thumbs.db"]:
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             (root / rel).write_text("x")
-        self.root = ctk.CTk()
-        self.root.withdraw()
-        self.addCleanup(self.root.destroy)
+        self.root = self.shared_root()
 
     def open(self, patterns, steps):
         from skip_picker import SkipPicker
@@ -92,6 +104,132 @@ class PickerTests(unittest.TestCase):
         self.root.after(300, steps)
         self.assertEqual(SkipPicker(self.root, str(Path(self.tmp.name) / "nope"), ["Project/.venv"]).result,
                          ["Project/.venv"])
+
+
+class PathDrive(TwoWayFakeDrive):
+    def find_folder(self, name, parent):
+        return next((i["id"] for i in self.list_children(parent)
+                     if i["name"] == name and i["mimeType"] == FOLDER_MIME), None)
+
+    def mkdirs(self, path):
+        cur = "root"
+        for part in path.split("/"):
+            cur = self.find_folder(part, cur) or self.create_folder(part, cur)
+        return cur
+
+
+class SkipOnDriveSyncTests(unittest.TestCase):
+    """A skipped item that's only on Drive is never downloaded, and nothing is deleted on either side."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pc = Path(self.tmp.name) / "pc"
+        self.pc.mkdir()
+        self.state = Path(self.tmp.name) / "s.json"
+        self.drive = PathDrive()
+        self.drive.mkdirs("Big Drive Only [2024]/Raw")
+        self.drive.web_add("Big Drive Only [2024]/Raw", "clip.mp4", "video")
+        self.drive.web_add("", "keep.txt", "k")
+        (self.pc / "a.txt").write_text("a")
+
+    def sync(self, skip):
+        return TwoWaySyncer(self.drive, self.pc, "root", excludes=DEFAULT_EXCLUDES + skip,
+                            state_path=self.state, recycle=lambda p: self.fail(f"recycled {p}")).run()
+
+    def test_skipped_drive_folder_is_not_downloaded(self):
+        self.sync([pattern_for("Big Drive Only [2024]")])
+        self.assertEqual(local_tree(self.pc), {"a.txt": "a", "keep.txt": "k"})
+        self.assertIn("Big Drive Only [2024]/Raw/clip.mp4", self.drive.tree())
+        self.assertIn("a.txt", self.drive.tree())
+
+    def test_skipping_a_synced_folder_later_deletes_nothing(self):
+        self.sync([])
+        self.assertTrue((self.pc / "Big Drive Only [2024]/Raw/clip.mp4").exists())
+        s = self.sync([pattern_for("Big Drive Only [2024]")])
+        self.assertEqual((s["trashed"], s["deleted_local"]), (0, 0))
+        self.assertTrue((self.pc / "Big Drive Only [2024]/Raw/clip.mp4").exists())
+        self.assertIn("Big Drive Only [2024]/Raw/clip.mp4", self.drive.tree())
+
+
+class DrivePickerTests(PickerTests):
+    """The picker shows what's only on Google Drive (fetched in the background) and can skip it."""
+
+    def setUp(self):
+        super().setUp()
+        self.drive = PathDrive()
+        self.drive.mkdirs("EBC/Project/Old on Drive")
+        self.drive.mkdirs("EBC/Big Drive Only")
+        self.drive.web_add("EBC/Big Drive Only", "clip.mp4", "video")
+        self.drive.web_add("EBC", "report.pdf", "r")
+        self.app = types.SimpleNamespace(drive_for_browsing=lambda email: self.drive)
+
+    def open_drive(self, patterns, steps):
+        from skip_picker import SkipPicker, drive_lister
+        seen = {}
+
+        def wait_then(p, fn, tries=100):
+            if not p.loading_row or tries == 0:
+                fn()
+            else:
+                p.after(50, lambda: wait_then(p, fn, tries - 1))
+
+        def run():
+            p = self.root.winfo_children()[-1]
+            steps(p, seen, lambda fn: wait_then(p, fn))
+        self.root.after(200, run)
+        lister = drive_lister(self.app, "me@example.com", None, "My Drive/EBC")
+        result = SkipPicker(self.root, self.tmp.name, patterns, drive_list=lister, drive_label="My Drive/EBC").result
+        return result, seen
+
+    def test_drive_only_items_show_and_can_be_skipped(self):
+        def steps(p, seen, wait):
+            def loaded():
+                seen["top"] = [p.tree.item(c, "text") for c in p.tree.get_children("")]
+                big = p.item_of["Big Drive Only"]
+                p._fill(big, "Big Drive Only")                       # open a folder only on Drive
+                p._fill(p.item_of["Project"], "Project")             # and one on both sides
+                wait(after_open)
+
+            def after_open():
+                seen["big"] = [p.tree.item(c, "text") for c in p.tree.get_children(p.item_of["Big Drive Only"])]
+                seen["project"] = [p.tree.item(c, "text") for c in p.tree.get_children(p.item_of["Project"])]
+                p.toggle(p.item_of["Big Drive Only"])
+                p.toggle(p.item_of["report.pdf"])
+                p.done()
+            wait(loaded)
+
+        result, seen = self.open_drive([], steps)
+        top = "\n".join(seen["top"])
+        self.assertIn("Big Drive Only   ·  only on Google Drive", top)
+        self.assertIn("report.pdf   ·  only on Google Drive", top)
+        self.assertNotIn("Project   ·", top)                          # on both sides: no marker
+        self.assertEqual(sum("Project" in t for t in seen["top"]), 1)  # listed once
+        self.assertTrue(any("clip.mp4" in t for t in seen["big"]))
+        self.assertTrue(any("Old on Drive" in t and "only on Google Drive" in t for t in seen["project"]))
+        self.assertEqual(result, ["Big Drive Only", "report.pdf"])
+
+    def test_reopening_ticks_saved_drive_only_items(self):
+        def steps(p, seen, wait):
+            seen["before"] = list(p.other)
+
+            def loaded():
+                seen["after"] = list(p.other)
+                seen["text"] = p.tree.item(p.item_of["Big Drive Only"], "text")
+                p.done()
+            wait(loaded)
+
+        result, seen = self.open_drive(["Big Drive Only", "*.psd"], steps)
+        self.assertEqual(seen["before"], ["Big Drive Only", "*.psd"])
+        self.assertEqual(seen["after"], ["*.psd"])
+        self.assertTrue(seen["text"].startswith("☑"))
+        self.assertEqual(result, ["Big Drive Only", "*.psd"])
+
+    def test_drive_folder_not_created_yet(self):
+        from skip_picker import drive_lister
+        lister = drive_lister(self.app, "me@example.com", None, "My Drive/Not There")
+        self.assertEqual(lister(None), [])
+        self.assertNotIn("Not There", self.drive.tree())
 
 
 if __name__ == "__main__":

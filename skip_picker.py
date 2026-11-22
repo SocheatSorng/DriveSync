@@ -1,13 +1,17 @@
-"""Choose what a synced folder skips: tick common items, or files and folders in a tree of the PC folder.
+"""Choose what a synced folder skips: tick common items, or files and folders in a tree that shows both
+the PC folder and its Google Drive folder (so things only on Drive can be kept off this PC).
 
 The result is the same list of patterns the "Skip files or folders matching" box holds: a name like
 `node_modules` (skipped anywhere) or a path inside the synced folder like `Project/.venv` (just that one).
+A skipped item isn't synced either way: not downloaded, not uploaded, and left alone on both sides.
 """
 from __future__ import annotations
 
 import fnmatch
 import glob
 import os
+import queue
+import threading
 import tkinter as tk
 from tkinter import ttk
 
@@ -19,6 +23,7 @@ SECONDARY = {"fg_color": "transparent", "border_width": 1, "text_color": ("#1f1f
              "border_color": ("#c4c7c5", "#5f6368"), "hover_color": ("#e8eaed", "#3c4043")}
 MAX_ROWS = 1000          # entries shown per folder in the tree (the rest are summed up in one row)
 OFF, ON, INHERITED = "☐", "☑", "▣"
+ONLY_DRIVE = "only on Google Drive"
 
 # (pattern, what it is) - things people commonly don't want synced.
 COMMON = [
@@ -49,13 +54,51 @@ def split_patterns(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
 
 
-class SkipPicker(ctk.CTkToplevel):
-    """self.result = the chosen list of patterns, or None if cancelled."""
+def drive_lister(app, email: str, root_id: str | None, path: str):
+    """list(folder_id) for SkipPicker: what's in a folder of this synced folder's Drive side, as
+    [{"name", "id", "is_dir"}]. folder_id None = the synced Drive folder itself ([] if it doesn't
+    exist yet). Runs on the picker's background thread; one Drive connection, one call at a time."""
+    from drive_sync import FOLDER_MIME
+    lock, conn, root = threading.Lock(), {}, {"id": root_id}
 
-    def __init__(self, parent, local: str, patterns: list[str], always: list[str] = ()):
+    def find_root(d):
+        parent = "root"
+        parts = [p for p in path.replace("\\", "/").split("/") if p]
+        if parts and parts[0].lower() == "my drive":
+            parts = parts[1:]
+        for part in parts:
+            parent = d.find_folder(part, parent)
+            if parent is None:
+                return None
+        return parent
+
+    def list_folder(folder_id):
+        with lock:
+            if "drive" not in conn:
+                conn["drive"] = app.drive_for_browsing(email)
+            d = conn["drive"]
+            if folder_id is None:
+                if root["id"] is None:
+                    root["id"] = find_root(d)
+                folder_id = root["id"]
+                if folder_id is None:
+                    return []
+            # Google Docs/Sheets, shortcuts etc. are never synced, so they aren't offered.
+            return [{"name": i["name"], "id": i["id"], "is_dir": i["mimeType"] == FOLDER_MIME}
+                    for i in d.list_children(folder_id) if i["mimeType"] == FOLDER_MIME or "md5Checksum" in i]
+    return list_folder
+
+
+class SkipPicker(ctk.CTkToplevel):
+    """self.result = the chosen list of patterns, or None if cancelled.
+
+    drive_list: optional list(folder_id) (see drive_lister) - adds what's on Google Drive to the tree."""
+
+    def __init__(self, parent, local: str, patterns: list[str], always: list[str] = (),
+                 drive_list=None, drive_label: str = ""):
         super().__init__(parent)
         self.title("Choose what to skip")
-        self.geometry("620x620")
+        self.geometry("620x640")
         self.minsize(480, 460)
         self.transient(parent)
         self.result = None
@@ -68,9 +111,14 @@ class SkipPicker(ctk.CTkToplevel):
         self.rel_of: dict[str, str] = {}              # tree item id -> path inside the synced folder
         self.item_of: dict[str, str] = {}             # and back
         self.loaded: set[str] = set()                 # folders whose contents are in the tree
+        self.drive_list = drive_list
+        self.drive_ids: dict[str, str | None] = {"": None}   # folder path -> its Drive folder id
+        self.drive_asked: set[str] = set()            # folder paths whose Drive side was asked for
+        self.loading_row: dict[str, str] = {}         # folder path -> its "Loading Google Drive…" row
+        self.results: queue.Queue = queue.Queue()
 
         # A saved pattern that names one existing file/folder shows as a ticked tree item; others
-        # (like *.psd) are kept as they are.
+        # (like *.psd, or something only on Drive) are kept as they are until the tree shows them.
         ticked = []
         for p in patterns:
             if p in common_names:
@@ -98,12 +146,16 @@ class SkipPicker(ctk.CTkToplevel):
                 row=i // 2, column=i % 2, sticky="w", padx=4, pady=2)
         grid.columnconfigure((0, 1), weight=1, uniform="c")
 
-        ctk.CTkLabel(self, text=f"In {local}", font=font(13, "bold"), anchor="w").pack(
-            fill="x", padx=18, pady=(14, 0))
-        ctk.CTkLabel(self, text="Click a file or folder to skip it (and everything in it). "
-                                f"{INHERITED} = skipped because of a rule above or a skipped folder.",
-                     font=font(12), text_color=MUTED, anchor="w", justify="left", wraplength=560).pack(
-            fill="x", padx=18)
+        where = f"{local} and {drive_label}" if drive_list and drive_label else local
+        ctk.CTkLabel(self, text=f"In {where}", font=font(13, "bold"), anchor="w", justify="left",
+                     wraplength=560).pack(fill="x", padx=18, pady=(14, 0))
+        help_text = "Click a file or folder to skip it (and everything in it). Skipped items aren't synced " \
+                    "either way and are left alone on both sides."
+        if drive_list:
+            help_text += f" Items marked “{ONLY_DRIVE}” are never downloaded to this PC if you skip them."
+        help_text += f"  {INHERITED} = skipped by a rule above or a skipped folder."
+        ctk.CTkLabel(self, text=help_text, font=font(12), text_color=MUTED, anchor="w", justify="left",
+                     wraplength=560).pack(fill="x", padx=18)
         self.other_lbl = ctk.CTkLabel(self, text="", font=font(12), text_color=MUTED, anchor="w",
                                       justify="left", wraplength=560)
         self.other_lbl.pack(side="bottom", fill="x", padx=18, pady=(0, 6))
@@ -118,11 +170,12 @@ class SkipPicker(ctk.CTkToplevel):
         self.tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
         self.tree.tag_configure("inherited", foreground="#9aa0a6")
         self.tree.tag_configure("note", foreground="#9aa0a6")
+        self.tree.tag_configure("drive", foreground="#1a73e8")
         self.tree.bind("<<TreeviewOpen>>", self._on_open)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<space>", lambda _: self.toggle(self.tree.focus()))
 
-        if os.path.isdir(local):
+        if os.path.isdir(local) or drive_list:
             self._fill("", "")
             for rel in ticked:
                 self._reveal(rel)
@@ -133,11 +186,12 @@ class SkipPicker(ctk.CTkToplevel):
         self.bind("<Escape>", lambda _: self.destroy())
         self.update_idletasks()
         scale = self._get_window_scaling()
-        w, h = round(620 * scale), round(620 * scale)
+        w, h = round(620 * scale), round(640 * scale)
         x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
         y = min(parent.winfo_rooty(), self.winfo_screenheight() - h - round(80 * scale))
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         self.after(100, self._grab)
+        self.after(100, self._poll)
         self.wait_window()
 
     def _grab(self):
@@ -183,32 +237,110 @@ class SkipPicker(ctk.CTkToplevel):
             self.tree.item(item, open=True)
 
     # -- the tree ------------------------------------------------------------------
+    def _add_row(self, parent_item: str, rel: str, is_dir: bool, only_drive: bool) -> str:
+        item = self.tree.insert(parent_item, "end", text=rel.rsplit("/", 1)[-1],
+                                values=("dir" if is_dir else "", "drive" if only_drive else ""))
+        self.rel_of[item] = rel
+        self.item_of[rel] = item
+        if is_dir:
+            self.tree.insert(item, "end", text="…")    # placeholder so it can be opened
+        return item
+
     def _fill(self, parent_item: str, rel_dir: str):
-        """Put one folder's contents in the tree: folders first, then files (biggest folders stay fast:
-        subfolders are only read when opened)."""
+        """Put one folder's contents in the tree: what's on this PC now, what's on Drive when it
+        arrives. Subfolders are only read when opened, so big folders stay fast."""
         self.loaded.add(parent_item)
         for child in self.tree.get_children(parent_item):
             self.tree.delete(child)
         path = os.path.join(self.local, *rel_dir.split("/")) if rel_dir else self.local
+        entries = []
         try:
             with os.scandir(path) as it:
                 entries = [(e.name, e.is_dir(follow_symlinks=False)) for e in it]
+        except FileNotFoundError:
+            pass                                       # only on Drive: its contents come from there
         except OSError as e:
             self.tree.insert(parent_item, "end", text=f"Couldn't read this folder: {e.strerror or e}",
                              tags=("note",))
-            return
         entries.sort(key=lambda x: (not x[1], x[0].lower()))
         for name, is_dir in entries[:MAX_ROWS]:
-            rel = f"{rel_dir}/{name}" if rel_dir else name
-            item = self.tree.insert(parent_item, "end", text=name)
-            self.rel_of[item] = rel
-            self.item_of[rel] = item
-            if is_dir:
-                self.tree.item(item, values=("dir",))
-                self.tree.insert(item, "end", text="…")    # placeholder so it can be opened
+            self._add_row(parent_item, f"{rel_dir}/{name}" if rel_dir else name, is_dir, False)
         if len(entries) > MAX_ROWS:
             self.tree.insert(parent_item, "end", text=f"…and {len(entries) - MAX_ROWS:,} more "
                                                       "(type a pattern in the box to skip those)", tags=("note",))
+        self._ask_drive(parent_item, rel_dir)
+
+    def _ask_drive(self, parent_item: str, rel_dir: str):
+        """Fetch this folder's Drive side in the background (once its Drive folder id is known)."""
+        if not self.drive_list or rel_dir in self.drive_asked or rel_dir not in self.drive_ids:
+            return
+        if rel_dir and self.drive_ids[rel_dir] is None:
+            return                                     # not on Drive
+        self.drive_asked.add(rel_dir)
+        self.loading_row[rel_dir] = self.tree.insert(parent_item, "end", text="Loading Google Drive…",
+                                                     tags=("note",))
+        folder_id = self.drive_ids[rel_dir]
+
+        def work():
+            try:
+                out = self.drive_list(folder_id)
+            except Exception as e:  # noqa: BLE001 - shown in the tree
+                out = e
+            self.results.put((parent_item, rel_dir, out))
+        threading.Thread(target=work, daemon=True, name="skip-drive").start()
+
+    def _poll(self):
+        try:
+            while True:
+                self._add_drive(*self.results.get_nowait())
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return                                     # window closed
+        if self.winfo_exists():
+            self.after(100, self._poll)
+
+    def _add_drive(self, parent_item: str, rel_dir: str, out):
+        row = self.loading_row.pop(rel_dir, None)
+        if row and self.tree.exists(row):
+            self.tree.delete(row)
+        if parent_item and not self.tree.exists(parent_item):
+            return
+        if isinstance(out, Exception):
+            self.tree.insert(parent_item, "end", text=f"Couldn't read Google Drive: {out}", tags=("note",))
+            return
+        here = {self.rel_of[c].rsplit("/", 1)[-1].lower(): c for c in self.tree.get_children(parent_item)
+                if c in self.rel_of}
+        added = 0
+        for entry in sorted(out, key=lambda e: (not e["is_dir"], e["name"].lower())):
+            rel = f"{rel_dir}/{entry['name']}" if rel_dir else entry["name"]
+            if entry["is_dir"]:
+                self.drive_ids.setdefault(rel, entry["id"])
+            key = entry["name"].lower()
+            if key in here or added >= MAX_ROWS:
+                continue                               # on both sides (or Drive has two with one name)
+            here[key] = self._add_row(parent_item, rel, entry["is_dir"], True)
+            added += 1
+        # Keep folders first, then files, by name.
+        rows = [c for c in self.tree.get_children(parent_item) if c in self.rel_of]
+        rows.sort(key=lambda c: (not self._vals(c)[0], self.rel_of[c].rsplit("/", 1)[-1].lower()))
+        for i, c in enumerate(rows):
+            self.tree.move(c, parent_item, i)
+        # Saved patterns for things only on Drive now have a row: show them ticked.
+        for p in list(self.other):
+            if any(pattern_for(self.rel_of[c]) == p for c in rows):
+                self.other.remove(p)
+                self.paths.add(p)
+        # Subfolders opened before their Drive ids were known.
+        for c in rows:
+            if c in self.loaded:
+                self._ask_drive(c, self.rel_of[c])
+        self.refresh()
+
+    def _vals(self, item: str) -> tuple[str, str]:
+        """(is a folder, only on Drive) of a row - each "" or a marker."""
+        v = [str(x) for x in self.tree.item(item, "values") or ()] + ["", ""]
+        return v[0], v[1]
 
     def _on_open(self, _event):
         item = self.tree.focus()
@@ -258,12 +390,14 @@ class SkipPicker(ctk.CTkToplevel):
                 if rel is None:
                     continue
                 name = rel.rsplit("/", 1)[-1]
-                icon = "📁" if self.tree.item(item, "values") else "📄"
+                is_dir, only_drive = self._vals(item)
+                icon = "📁" if is_dir else "📄"
+                suffix = f"   ·  {ONLY_DRIVE}" if only_drive else ""
                 if self._inherited(rel):
                     box, tags = INHERITED, ("inherited",)
                 else:
-                    box, tags = (ON if pattern_for(rel) in self.paths else OFF), ()
-                self.tree.item(item, text=f"{box}  {icon}  {name}", tags=tags)
+                    box, tags = (ON if pattern_for(rel) in self.paths else OFF), (("drive",) if only_drive else ())
+                self.tree.item(item, text=f"{box}  {icon}  {name}{suffix}", tags=tags)
                 if item in self.loaded:
                     walk(item)
         walk("")
