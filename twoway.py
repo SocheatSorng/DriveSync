@@ -41,9 +41,9 @@ class _Done:
     """A finished 'future' for running a download synchronously (same interface as concurrent.futures)."""
 
     def __init__(self, fn):
-        self._error = None
+        self._error, self._value = None, None
         try:
-            fn()
+            self._value = fn()
         except Exception as e:  # noqa: BLE001 - re-raised by result()
             self._error = e
 
@@ -53,10 +53,24 @@ class _Done:
     def result(self):
         if self._error:
             raise self._error
+        return self._value
 
 
 class DriveFolderGone(Exception):
     """The Drive folder being synced was deleted/trashed - refuse to mirror that onto the PC."""
+
+
+class ChangedOnPC(Exception):
+    """The PC copy was saved while Drive's version was downloading: it's kept, not overwritten."""
+
+
+def _sig(path: Path) -> tuple[int, int] | None:
+    """(size, modified time) of a file, or None if it's gone - enough to tell that it was saved."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_size, st.st_mtime_ns
 
 
 def _join(rel_dir: str, name: str) -> str:
@@ -149,9 +163,26 @@ class TwoWaySyncer:
         for k in [k for k in self.base if k == rel or k.startswith(prefix)]:
             del self.base[k]
 
-    def _remember_file(self, rel: str, file_id: str, path: Path, md5: str) -> None:
-        st = path.stat()
-        self.base[rel] = {"t": "f", "id": file_id, "md5": md5, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    def _remember_file(self, rel: str, file_id: str, md5: str, sig: tuple[int, int] | None) -> None:
+        """Record a synced file. sig is the PC copy's (size, modified time) *when md5 was taken*: a
+        later save then never pairs with the old checksum, so the next sync sees it as changed."""
+        size, mtime_ns = sig or (-1, -1)  # gone already: the next sync works out what happened
+        self.base[rel] = {"t": "f", "id": file_id, "md5": md5, "size": size, "mtime_ns": mtime_ns}
+
+    def _remember_sent(self, rel: str, file_id: str, parent_id: str, path: Path, md5: str,
+                       sig: tuple[int, int] | None) -> None:
+        """Record a file just uploaded (md5/sig: the PC copy before sending). If it was saved again
+        while uploading, Drive may hold the old version - or, for a big file sent in pieces, a mix of
+        both - so remember what Drive really has. The next sync then sends the newer PC copy."""
+        if _sig(path) == sig:
+            return self._remember_file(rel, file_id, md5, sig)
+        log.info("%s changed while it was uploading - it will be sent again", rel)
+        try:
+            remote = next((c for c in self.drive.list_children(parent_id) if c["id"] == file_id), {})
+            md5 = remote.get("md5Checksum") or md5
+        except Exception as e:  # noqa: BLE001 - fall back to the checksum that was meant to be sent
+            log.warning("Couldn't check what Drive received for %s: %s", rel, e)
+        self._remember_file(rel, file_id, md5, sig)
 
     # -- helpers ---------------------------------------------------------------
     def _excluded(self, name: str, rel: str) -> bool:
@@ -180,10 +211,16 @@ class TwoWaySyncer:
         self._emit("error", rel or ".", f"{what}: {e}")
 
     def _md5(self, path: Path, b: dict | None) -> str:
+        return self._hash(path, b)[0]
+
+    def _hash(self, path: Path, b: dict | None) -> tuple[str, tuple[int, int]]:
+        """(md5, (size, modified time)) - the size/time read *before* the file, so a save made
+        while it's being read or sent shows up as a change next time."""
         st = path.stat()
-        if b and b.get("md5") and b.get("size") == st.st_size and b.get("mtime_ns") == st.st_mtime_ns:
-            return b["md5"]  # unchanged since the last sync: no need to read the file
-        return md5_of(path)
+        sig = (st.st_size, st.st_mtime_ns)
+        if b and b.get("md5") and (b.get("size"), b.get("mtime_ns")) == sig:
+            return b["md5"], sig  # unchanged since the last sync: no need to read the file
+        return md5_of(path), sig
 
     @staticmethod
     def _is_syncable_remote(item: dict) -> bool:
@@ -456,34 +493,34 @@ class TwoWaySyncer:
     # -- files ------------------------------------------------------------------------
     def _file(self, L, R, B, rel, path: Path, remote_id: str) -> None:
         if L is not None and R is not None:
-            lmd5, rmd5 = self._md5(path, B), R["md5Checksum"]
+            (lmd5, sig), rmd5 = self._hash(path, B), R["md5Checksum"]
             if lmd5 == rmd5:
                 self.stats["unchanged"] += 1
-                self._remember_file(rel, R["id"], path, lmd5)
+                self._remember_file(rel, R["id"], lmd5, sig)
                 return
             l_changed = not B or B.get("md5") != lmd5
             r_changed = not B or B.get("md5") != rmd5
             if l_changed and not r_changed:
-                self._xfer("update", rel, path.stat().st_size, self.drive.update, R["id"], path)
+                self._xfer("update", rel, sig[0], self.drive.update, R["id"], path)
                 self.stats["updated"] += 1
                 self._emit("updated", rel)
-                self._remember_file(rel, R["id"], path, lmd5)
+                self._remember_sent(rel, R["id"], remote_id, path, lmd5, sig)
             elif r_changed and not l_changed:
-                return self._queue_download(R, rel, path, "Changed on Google Drive")
+                return self._queue_download(R, rel, path, "Changed on Google Drive", sig)
             else:
                 self._conflict(R, rel, path, remote_id, rmd5)
         elif L is not None:                                    # on PC only
-            lmd5 = self._md5(path, B)
+            lmd5, sig = self._hash(path, B)
             if B and B.get("md5") == lmd5:
                 self.recycle(str(path))                        # deleted on Drive
                 self.stats["deleted_local"] += 1
                 self._emit("deleted_local", rel, "Deleted on Google Drive")
                 self._forget(rel)
                 return
-            file_id = self._xfer("upload", rel, path.stat().st_size, self.drive.upload, path, remote_id)
+            file_id = self._xfer("upload", rel, sig[0], self.drive.upload, path, remote_id)
             self.stats["uploaded"] += 1
             self._emit("uploaded", rel, "Kept: deleted on Drive, but changed on this PC" if B else None)
-            self._remember_file(rel, file_id, path, lmd5)
+            self._remember_sent(rel, file_id, remote_id, path, lmd5, sig)
         elif R is not None:                                    # on Drive only
             rmd5 = R["md5Checksum"]
             if B and B.get("md5") == rmd5:
@@ -493,15 +530,21 @@ class TwoWaySyncer:
                 self._forget(rel)
                 return
             return self._queue_download(R, rel, path, "Kept: deleted on this PC, but changed on Drive" if B
-                                        else "New on Google Drive")
+                                        else "New on Google Drive", _sig(path))
         else:
             self._forget(rel)
 
     # -- parallel downloads ---------------------------------------------------------------
-    def _queue_download(self, R: dict, rel: str, path: Path, message: str):
+    def _queue_download(self, R: dict, rel: str, path: Path, message: str, sig: tuple[int, int] | None):
         """Start downloading in the background (up to `parallel` at once). Everything that
-        changes the saved sync state happens later, back on this thread, in _finish_downloads."""
+        changes the saved sync state happens later, back on this thread, in _finish_downloads.
+        sig: the PC copy's (size, modified time) when the download was decided (None: no PC copy).
+        If it's saved meanwhile, the download isn't used - the next sync sees both sides changed."""
         size = int(R.get("size") or 0)
+
+        def still_as_decided():
+            if _sig(path) != sig:
+                raise ChangedOnPC()
 
         def work():
             if self.progress:
@@ -509,7 +552,8 @@ class TwoWaySyncer:
             try:
                 self.drive.download(R["id"], path, expected_md5=R["md5Checksum"], size=size,
                                     on_bytes=(lambda got: self.progress.transfer_bytes(rel, got))
-                                    if self.progress else None)
+                                    if self.progress else None, before_replace=still_as_decided)
+                return _sig(path)  # right away: a save after this is a new change
             finally:
                 if self.progress:
                     self.progress.transfer_end(rel)
@@ -530,10 +574,15 @@ class TwoWaySyncer:
                 still.append((fut, (rel, path, R, message, size)))
                 continue
             try:
-                fut.result()
+                got = fut.result()
                 self.stats["downloaded"] += 1
                 self._emit("downloaded", rel, message)
-                self._remember_file(rel, R["id"], path, R["md5Checksum"])
+                self._remember_file(rel, R["id"], R["md5Checksum"], got)
+            except ChangedOnPC:
+                log.info("%s was saved on this PC while Drive's version was downloading - kept yours", rel)
+                self.stats["skipped"] += 1
+                self._emit("skipped", rel, "Saved on this PC while Drive's version was downloading - "
+                                           "yours was kept; it's checked again next sync")
             except Exception as e:  # noqa: BLE001 - the other downloads carry on
                 self._fail(rel, "Couldn't download", e)
             finally:
@@ -553,10 +602,11 @@ class TwoWaySyncer:
         except Exception:
             os.replace(keep, path)  # put the PC version back; try again next time
             raise
-        self._remember_file(rel, R["id"], path, rmd5)
+        self._remember_file(rel, R["id"], rmd5, _sig(path))
         keep_rel = _join(_parent(rel), keep.name)
-        keep_id = self._xfer("upload", keep_rel, keep.stat().st_size, self.drive.upload, keep, remote_id)
-        self._remember_file(keep_rel, keep_id, keep, md5_of(keep))
+        keep_md5, keep_sig = self._hash(keep, None)
+        keep_id = self._xfer("upload", keep_rel, keep_sig[0], self.drive.upload, keep, remote_id)
+        self._remember_sent(keep_rel, keep_id, remote_id, keep, keep_md5, keep_sig)
         self.stats["conflicts"] += 1
         self._emit("conflict", rel, f"Edited on both this PC and Drive. Drive's version kept this name; "
                                     f"your PC version was saved as “{keep.name}” (on both sides).")

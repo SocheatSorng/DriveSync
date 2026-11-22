@@ -70,7 +70,9 @@ class FakeDrive:
         self.items[fid].update(content=data, md5Checksum=hashlib.md5(data).hexdigest())
         self._touch(fid)
 
-    def download(self, fid, dest, **kw):
+    def download(self, fid, dest, before_replace=None, **kw):
+        if before_replace:
+            before_replace()
         Path(dest).write_bytes(self.items[fid]["content"])
 
     def trash(self, fid):
@@ -298,6 +300,76 @@ class TwoWayTests(unittest.TestCase):
         self.start()
         self.write("~drivesync-x.part", "partial")
         self.assertEqual(self.sync(), [])
+
+    # -- saved again while syncing ---------------------------------------------
+    def _save_during(self, method, text, drive_gets=None):
+        """Make drive.<method> act as if the user saved `text` while it was transferring (and, for
+        uploads, as if Drive ended up with `drive_gets` - e.g. a mix of old and new bytes)."""
+        real = getattr(self.drive, method)
+
+        def during(fid_or_path, *args, **kw):
+            if method == "download":
+                self.write(Path(args[0]).relative_to(self.pc).as_posix(), text)
+                return real(fid_or_path, *args, **kw)
+            result = real(fid_or_path, *args, **kw)
+            fid = result if method == "upload" else fid_or_path
+            if drive_gets is not None:
+                data = drive_gets.encode()
+                self.drive.items[fid].update(content=data, md5Checksum=hashlib.md5(data).hexdigest())
+            path = Path(args[0] if method == "update" else fid_or_path)
+            self.write(path.relative_to(self.pc).as_posix(), text)
+            setattr(self.drive, method, real)  # only the first transfer
+            return result
+
+        setattr(self.drive, method, during)
+
+    def test_saved_while_updating_is_sent_next_sync(self):
+        self.start()
+        self.write("notes.txt", "n2")
+        self._save_during("update", "n3")
+        self.assertEqual(self.sync(), [("updated", "notes.txt")])
+        self.assertEqual(self.sync(), [("updated", "notes.txt")])   # the newer save isn't lost
+        self.assertEqual(self.drive.tree()["notes.txt"], "n3")
+        self.assertEqual(self.sync(), [])
+
+    def test_big_file_saved_mid_upload_does_not_come_back_mixed(self):
+        # Big files go up in pieces: Drive can end up with half old, half new bytes.
+        self.start()
+        self.write("notes.txt", "n2")
+        self._save_during("update", "n3", drive_gets="n2-and-n3-mixed")
+        self.sync()
+        self.assertEqual(self.sync(), [("updated", "notes.txt")])   # PC copy wins, no conflict
+        self.assertEqual((self.pc / "notes.txt").read_text(), "n3")
+        self.assertEqual(self.drive.tree()["notes.txt"], "n3")
+
+    def test_new_file_saved_while_uploading_is_sent_next_sync(self):
+        self.start()
+        self.write("new.txt", "v1")
+        self._save_during("upload", "v2")
+        self.assertEqual(self.sync(), [("uploaded", "new.txt")])
+        self.assertEqual(self.sync(), [("updated", "new.txt")])
+        self.assertEqual(self.drive.tree()["new.txt"], "v2")
+
+    def test_saved_while_downloading_keeps_the_pc_version(self):
+        self.start()
+        self.drive.web_edit("notes.txt", "web")
+        self._save_during("download", "pc")
+        self.assertEqual(self.sync(), [("skipped", "notes.txt")])
+        self.assertEqual((self.pc / "notes.txt").read_text(), "pc")   # not overwritten
+        ev = self.sync()                                              # now: edited on both sides
+        self.assertIn(("conflict", "notes.txt"), ev)
+        self.assertEqual((self.pc / "notes.txt").read_text(), "web")
+        kept = [v for k, v in local_tree(self.pc).items() if "conflict" in k]
+        self.assertEqual(kept, ["pc"])
+
+    def test_created_on_pc_while_new_drive_file_downloads(self):
+        self.start()
+        self.drive.web_add("", "report.txt", "web")
+        self._save_during("download", "pc")
+        self.assertEqual(self.sync(), [("skipped", "report.txt")])
+        self.assertEqual((self.pc / "report.txt").read_text(), "pc")
+        self.assertIn(("conflict", "report.txt"), self.sync())
+        self.assertEqual(sorted(v for k, v in local_tree(self.pc).items() if "report" in k), ["pc", "web"])
 
     # -- upgrade from upload-only -----------------------------------------------
     def test_switching_from_upload_only_respects_earlier_syncs(self):

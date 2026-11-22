@@ -158,8 +158,9 @@ def _split(start: int, end: int, n: int) -> list[list[int]]:
 def download(creds, file_id: str, dest: Path, *, prefix: str, expected_md5: str | None = None,
              size: int | None = None, on_bytes: Callable[[int], None] | None = None, retries: int = 6,
              session=None, sleep: Callable[[float], None] = time.sleep, limiter: RateLimiter | None = None,
-             connections: int | None = None) -> None:
-    """Download a Drive file to dest (via a .part file), resuming and verifying as described above."""
+             connections: int | None = None, before_replace: Callable[[], None] | None = None) -> None:
+    """Download a Drive file to dest (via a .part file), resuming and verifying as described above.
+    before_replace runs just before dest is replaced; if it raises, dest is left alone."""
     tmp = part_path(dest, prefix)
     record = _record_path(tmp)
     limiter = limiter or LIMIT
@@ -184,6 +185,13 @@ def download(creds, file_id: str, dest: Path, *, prefix: str, expected_md5: str 
                 raise DownloadError("The downloaded file didn't match Google's checksum (twice) - not used")
             log.warning("Downloaded %s didn't match Google's checksum - downloading it again", dest.name)
             continue
+        if before_replace:
+            try:
+                before_replace()
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                record.unlink(missing_ok=True)
+                raise
         os.replace(tmp, dest)
         record.unlink(missing_ok=True)
         return

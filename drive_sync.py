@@ -176,13 +176,13 @@ class Drive:
 
     # -- two-way sync -------------------------------------------------------
     def download(self, file_id: str, dest: Path, *, expected_md5: str | None = None, size: int | None = None,
-                 on_bytes=None) -> None:
+                 on_bytes=None, before_replace=None) -> None:
         """Download a file to dest - full speed, resumable, checksum-verified, split into parts in
         "High priority" mode, within the speed limit (see downloader.py).
         Safe to call from several threads at once (each thread uses its own connection)."""
         import downloader
         downloader.download(self.creds, file_id, dest, prefix=DOWNLOAD_PREFIX, expected_md5=expected_md5,
-                            size=size, on_bytes=on_bytes)
+                            size=size, on_bytes=on_bytes, before_replace=before_replace)
 
     @property
     def creds(self):

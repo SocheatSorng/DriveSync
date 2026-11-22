@@ -123,6 +123,17 @@ class DownloadTests(unittest.TestCase):
         with self.assertRaises(downloader.DownloadError):
             self.get(["timeout"] * 10, retries=3)
 
+    def test_file_saved_during_download_is_not_replaced(self):
+        self.dest.write_bytes(b"saved while downloading")
+
+        def changed():
+            raise RuntimeError("changed on PC")
+
+        with self.assertRaises(RuntimeError):
+            self.get([], before_replace=changed)
+        self.assertEqual(self.dest.read_bytes(), b"saved while downloading")       # untouched
+        self.assertFalse(downloader.part_path(self.dest, "~drivesync-").exists())  # no leftovers
+
 
 class SplitDownloadTests(unittest.TestCase):
     """'High priority': one big file in several parts at once."""
