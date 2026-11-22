@@ -203,6 +203,12 @@ class TwoWaySyncer(StorageFullMixin):
         import fnmatch
         return any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) for p in self.excludes)
 
+    def _in_skipped(self, rel: str) -> bool:
+        """Is this path skipped, or inside a skipped folder? A quick sync goes straight to changed
+        folders, so a folder skipped after it was synced must not be entered from below."""
+        parts = [p for p in rel.split("/") if p]
+        return any(self._excluded(parts[i], "/".join(parts[:i + 1])) for i in range(len(parts)))
+
     def _xfer(self, action: str, rel: str, size: int, fn, *args):
         self._check_full(action)
         if self.progress:
@@ -391,6 +397,8 @@ class TwoWaySyncer(StorageFullMixin):
         return s
 
     def _dir(self, local_dir: Path, remote_id: str, rel_dir: str, deep: bool = True) -> None:
+        if rel_dir and self._in_skipped(rel_dir):
+            return                                  # skipped: left alone on both sides
         try:
             local = {}
             for e in os.scandir(local_dir):

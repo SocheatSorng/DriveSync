@@ -165,6 +165,45 @@ class SkipOnDriveSyncTests(unittest.TestCase):
         self.assertIn("Big Drive Only [2024]/Raw/clip.mp4", self.drive.tree())
 
 
+    def quick_sync(self, skip, paths=()):
+        """What the app does after a change: only look at the folders that changed."""
+        syncer = TwoWaySyncer(self.drive, self.pc, "root", excludes=DEFAULT_EXCLUDES + skip,
+                              state_path=self.state, recycle=lambda p: self.fail(f"recycled {p}"))
+        targets = syncer.targets_for(paths, self.drive.take_changes())
+        self.assertIsNotNone(targets)                                # really a quick sync
+        return syncer.run(targets)
+
+    def test_quick_sync_never_goes_into_a_folder_skipped_after_it_was_synced(self):
+        self.sync([])                                                # synced before it was skipped
+        skip = [pattern_for("Big Drive Only [2024]")]
+        self.drive.take_changes()
+        self.drive.web_add("Big Drive Only [2024]/Raw", "new.mp4", "new video")
+        self.drive.web_edit("Big Drive Only [2024]/Raw/clip.mp4", "edited on Drive")
+        s = self.quick_sync(skip)
+        self.assertEqual(s["downloaded"], 0)
+        self.assertFalse((self.pc / "Big Drive Only [2024]/Raw/new.mp4").exists())
+        self.assertEqual((self.pc / "Big Drive Only [2024]/Raw/clip.mp4").read_text(), "video")
+
+    def test_quick_sync_never_uploads_from_a_skipped_folder(self):
+        self.sync([])
+        skip = [pattern_for("Big Drive Only [2024]")]
+        self.drive.take_changes()
+        new = self.pc / "Big Drive Only [2024]/Raw/from pc.txt"
+        new.write_text("pc")
+        s = self.quick_sync(skip, paths=[str(new)])
+        self.assertEqual(s["uploaded"], 0)
+        self.assertNotIn("Big Drive Only [2024]/Raw/from pc.txt", self.drive.tree())
+
+    def test_new_drive_file_in_a_skipped_drive_only_folder_quick_sync(self):
+        skip = [pattern_for("Big Drive Only [2024]")]
+        self.sync(skip)
+        self.drive.take_changes()
+        self.drive.web_add("Big Drive Only [2024]/Raw", "new.mp4", "new video")
+        self.drive.web_add("", "top.txt", "t")
+        self.quick_sync(skip)
+        self.assertEqual(local_tree(self.pc), {"a.txt": "a", "keep.txt": "k", "top.txt": "t"})
+
+
 class DrivePickerTests(PickerTests):
     """The picker shows what's only on Google Drive (fetched in the background) and can skip it."""
 
