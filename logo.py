@@ -41,6 +41,46 @@ def draw(size: int, color: str = GREEN, tile: str | None = None) -> Image.Image:
     return img.resize((size, size), Image.LANCZOS)
 
 
+def _badged(size: int, color: str, badge: str, symbol) -> Image.Image:
+    """The logo with a round badge in its bottom-right corner; symbol(draw, cx, cy, d) draws on it.
+    A transparent ring is cut around the badge so it stays readable at tray size (16 px)."""
+    big = size * SS
+    img = draw(big, color)
+    d = big * 0.58                       # badge diameter
+    x0, y0 = big - d, big - d
+    gap = big * 0.07
+    hole = Image.new("L", (big, big), 0)
+    ImageDraw.Draw(hole).ellipse((x0 - gap, y0 - gap, big + gap, big + gap), fill=255)
+    a = img.getchannel("A")
+    a.paste(0, mask=hole)
+    img.putalpha(a)
+    dr = ImageDraw.Draw(img)
+    dr.ellipse((x0, y0, big - 1, big - 1), fill=badge)
+    symbol(dr, x0 + d / 2, y0 + d / 2, d)
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def draw_paused(size: int, color: str = "#8b949e", badge: str = "#5f6368") -> Image.Image:
+    """The logo in grey with a pause badge (two white bars)."""
+    def bars(dr, cx, cy, d):
+        bw, bh = d * 0.16, d * 0.46      # bar width / height
+        for bx in (cx - bw * 1.25, cx + bw * 0.25):
+            dr.rectangle((bx, cy - bh / 2, bx + bw, cy + bh / 2), fill="white")
+    return _badged(size, color, badge, bars)
+
+
+def draw_syncing_frames(size: int, color: str = "#ffb020", badge: str = "#5f6368",
+                        frames: int = 8) -> list[Image.Image]:
+    """The logo in amber with a spinning arc on its badge: one image per animation frame."""
+    out = []
+    for i in range(frames):
+        def arc(dr, cx, cy, d, start=i * 360 / frames):
+            r = d * 0.30
+            dr.arc((cx - r, cy - r, cx + r, cy + r), start, start + 270, fill="white", width=max(1, round(d * 0.15)))
+        out.append(_badged(size, color, badge, arc))
+    return out
+
+
 def write_ico(path: Path) -> None:
     imgs = [draw(n) for n in ICO_SIZES]
     imgs[-1].save(path, format="ICO", sizes=[(n, n) for n in ICO_SIZES], append_images=imgs[:-1])

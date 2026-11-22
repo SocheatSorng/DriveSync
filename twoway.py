@@ -22,18 +22,23 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from downloader import PARALLEL
-from drive_sync import FOLDER_MIME, md5_of
+from drive_sync import FOLDER_MIME, NotEnoughSpace, StorageFullMixin, md5_of
+from progress import Paused
+
+DISK_MARGIN = 200 * 1024 * 1024   # keep this much free on the PC's disk after a download
 
 log = logging.getLogger("drive_sync")
 STATE_VERSION = 2
 PARALLEL_DOWNLOADS = PARALLEL  # one setting, shared with the tray menu's file lines
 QUEUED = object()  # _file() result: a download was started in the background
+DEFERRED = object()  # _file() result: a new PC file, sent at the end (it may turn out to be a move)
 SAVE_EVERY = 30.0  # seconds between saves of the sync state during a long sync
 
 
@@ -111,7 +116,7 @@ def migration_base(local_root: Path, old_cache: dict, last_sync: float, excluded
     return base
 
 
-class TwoWaySyncer:
+class TwoWaySyncer(StorageFullMixin):
     def __init__(self, drive, local_root: Path, remote_root_id: str, *, excludes: list[str],
                  state_path: Path, migrate_from: Path | None = None, on_event=None, recycle=None,
                  progress=None, parallel: int = PARALLEL_DOWNLOADS):
@@ -127,8 +132,17 @@ class TwoWaySyncer:
             from send2trash import send2trash as recycle
         self.recycle = recycle
         self.stats = dict(uploaded=0, updated=0, downloaded=0, deleted_local=0, trashed=0, folders=0,
-                          conflicts=0, unchanged=0, skipped=0, errors=0)
+                          conflicts=0, unchanged=0, skipped=0, errors=0, moved=0)
+        self.full: set[str] = set()   # "drive" / "pc" once that side is known to be full
+        # Renamed / moved on this PC = new there + gone from its old place. Both are kept until the
+        # end of the sync, so a match is moved on Drive instead of uploaded again.
+        self.can_move = hasattr(drive, "move")     # (turned off below for a first sync: nothing to move)
+        self.new_on_pc: list = []          # (rel, path, parent_id, md5, sig)
+        self.gone_files: list = []         # (rel, R, B) files deleted on this PC
+        self.gone_dirs: list = []          # (rel, R) folders deleted on this PC
+        self._by_size: dict[int, list[str]] | None = None   # synced files by size (see _could_be_moved)
         self.base: dict[str, dict] = self._load_base(migrate_from)
+        self.can_move = self.can_move and bool(self.base)
         self.children: dict[str, set[str]] = defaultdict(set)
         for rel in self.base:
             self.children[_parent(rel)].add(rel.rsplit("/", 1)[-1])
@@ -190,6 +204,7 @@ class TwoWaySyncer:
         return any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) for p in self.excludes)
 
     def _xfer(self, action: str, rel: str, size: int, fn, *args):
+        self._check_full(action)
         if self.progress:
             self.progress.transfer(action, rel, size)
         try:
@@ -197,6 +212,19 @@ class TwoWaySyncer:
         finally:
             if self.progress:
                 self.progress.transfer_end()
+
+    def _check_disk(self, size: int) -> None:
+        """Don't start a download that can't fit on this PC (leaves a little room for Windows)."""
+        if size < 1024 * 1024:
+            return
+        try:
+            free = shutil.disk_usage(self.local_root).free
+        except OSError:
+            return
+        if size + DISK_MARGIN > free:
+            from progress import human_size
+            raise NotEnoughSpace(f"Not enough space on this PC for this file ({human_size(size)}; "
+                                 f"{human_size(free)} free)")
 
     def _emit(self, kind: str, rel: str, message: str | None = None) -> None:
         if self.on_event:
@@ -206,6 +234,8 @@ class TwoWaySyncer:
                 log.debug("Activity hook failed: %s", e)
 
     def _fail(self, rel: str, what: str, e: Exception) -> None:
+        if self._fail_full(rel, e):
+            return
         log.error("%s %s: %s", what, rel or str(self.local_root), e)
         self.stats["errors"] += 1
         self._emit("error", rel or ".", f"{what}: {e}")
@@ -220,7 +250,13 @@ class TwoWaySyncer:
         sig = (st.st_size, st.st_mtime_ns)
         if b and b.get("md5") and (b.get("size"), b.get("mtime_ns")) == sig:
             return b["md5"], sig  # unchanged since the last sync: no need to read the file
-        return md5_of(path), sig
+        if not self.progress or st.st_size < 16 * 1024 * 1024:
+            return md5_of(path), sig
+        self.progress.read_start(path.relative_to(self.local_root).as_posix())
+        try:
+            return md5_of(path), sig
+        finally:
+            self.progress.read_end()
 
     @staticmethod
     def _is_syncable_remote(item: dict) -> bool:
@@ -339,6 +375,7 @@ class TwoWaySyncer:
                             if not b or b.get("t") != "d" or not b.get("id") or not path.is_dir():
                                 continue            # already handled while syncing its parent
                             self._dir(path, b["id"], rel, deep=False)
+                    self._settle_moves()
                 finally:
                     self._finish_downloads(wait=True)   # record every download before saving state
         finally:
@@ -414,7 +451,7 @@ class TwoWaySyncer:
                 self.progress.add_total(1, int(R.get("size") or 0))  # on Drive only: not counted yet
             queued = False
             try:
-                queued = self._file(L, R, B, rel, local_dir / name, remote_id) is QUEUED
+                queued = self._file(L, R, B, rel, local_dir / name, remote_id) in (QUEUED, DEFERRED)
             finally:
                 # A queued download is counted when it finishes (in _finish_downloads).
                 if self.progress and not queued and (L is not None or R is not None):
@@ -444,6 +481,9 @@ class TwoWaySyncer:
             self._dir(path, folder_id, rel)
         elif R is not None:                                   # on Drive only
             if B and not self._remote_has_new(R["id"], rel):
+                if self.can_move:
+                    self.gone_dirs.append((rel, R))           # trashed at the end (after any moves out)
+                    return
                 self.drive.trash(R["id"])                     # deleted on PC
                 self.stats["trashed"] += 1
                 self._emit("trashed", rel, "Deleted on this PC")
@@ -517,13 +557,17 @@ class TwoWaySyncer:
                 self._emit("deleted_local", rel, "Deleted on Google Drive")
                 self._forget(rel)
                 return
-            file_id = self._xfer("upload", rel, sig[0], self.drive.upload, path, remote_id)
-            self.stats["uploaded"] += 1
-            self._emit("uploaded", rel, "Kept: deleted on Drive, but changed on this PC" if B else None)
-            self._remember_sent(rel, file_id, remote_id, path, lmd5, sig)
+            if not B and self.can_move and self._could_be_moved(sig[0]):
+                self.new_on_pc.append((rel, path, remote_id, lmd5, sig))
+                return DEFERRED
+            self._upload_new(rel, path, remote_id, lmd5, sig,
+                             "Kept: deleted on Drive, but changed on this PC" if B else None)
         elif R is not None:                                    # on Drive only
             rmd5 = R["md5Checksum"]
             if B and B.get("md5") == rmd5:
+                if self.can_move:
+                    self.gone_files.append((rel, R, B))        # trashed at the end, unless it moved
+                    return
                 self.drive.trash(R["id"])                      # deleted on PC
                 self.stats["trashed"] += 1
                 self._emit("trashed", rel, "Deleted on this PC")
@@ -534,6 +578,80 @@ class TwoWaySyncer:
         else:
             self._forget(rel)
 
+    def _could_be_moved(self, size: int) -> bool:
+        """Could a new PC file of this size be a renamed / moved one? Only if a synced file of the same
+        size is missing from its place on this PC. Everything else uploads right away (holding back
+        every new file until the end would leave a big new folder at "Checking files" for ages)."""
+        if size <= 0:
+            return False
+        if self._by_size is None:
+            self._by_size = defaultdict(list)
+            for rel, b in self.base.items():
+                if b.get("t") == "f" and (b.get("size") or 0) > 0:
+                    self._by_size[b["size"]].append(rel)
+        return any(not (self.local_root / r).exists() for r in self._by_size.get(size, ()))
+
+    def _upload_new(self, rel: str, path: Path, remote_id: str, lmd5: str, sig, message: str | None = None):
+        file_id = self._xfer("upload", rel, sig[0], self.drive.upload, path, remote_id)
+        self.stats["uploaded"] += 1
+        self._emit("uploaded", rel, message)
+        self._remember_sent(rel, file_id, remote_id, path, lmd5, sig)
+
+    def _settle_moves(self) -> None:
+        """New files on this PC that match one that's gone from its old place (same content and size)
+        were renamed or moved: do the same on Drive instead of uploading again. Then trash what's
+        really gone."""
+        old: dict[tuple, list] = defaultdict(list)    # (md5, size) -> [(old rel, Drive id)]
+        for rel, R, B in self.gone_files:
+            old[(B.get("md5"), B.get("size"))].append((rel, R["id"]))
+        for rel, _R in self.gone_dirs:
+            prefix = rel + "/"
+            for k, b in self.base.items():
+                if k.startswith(prefix) and b.get("t") == "f" and b.get("id"):
+                    old[(b.get("md5"), b.get("size"))].append((k, b["id"]))
+        moved: set[str] = set()
+        new, self.new_on_pc = self.new_on_pc, []
+        for rel, path, parent_id, lmd5, sig in new:
+            try:
+                match = old.get((lmd5, sig[0])) if sig[0] > 0 else None   # empty files all look alike
+                if match:
+                    old_rel, file_id = match.pop(0)
+                    self.drive.move(file_id, rel.rsplit("/", 1)[-1], parent_id)
+                    moved.add(file_id)
+                    self._forget(old_rel)
+                    self._remember_sent(rel, file_id, parent_id, path, lmd5, sig)
+                    self.stats["moved"] += 1
+                    how = ("Renamed on Drive too" if _parent(old_rel) == _parent(rel) else "Moved on Drive too")
+                    self._emit("moved", rel, f"{how} (was {old_rel}) - not uploaded again")
+                else:
+                    self._upload_new(rel, path, parent_id, lmd5, sig)
+            except Exception as e:  # noqa: BLE001 - keep going with the other files
+                self._fail(rel, "Couldn't sync", e)
+            finally:
+                if self.progress:
+                    self.progress.file_done(sig[0])
+            self._save_now_and_then()
+        gone_files, self.gone_files = self.gone_files, []
+        for rel, R, _B in gone_files:
+            if R["id"] in moved:
+                continue
+            try:
+                self.drive.trash(R["id"])                      # deleted on PC
+                self.stats["trashed"] += 1
+                self._emit("trashed", rel, "Deleted on this PC")
+                self._forget(rel)
+            except Exception as e:  # noqa: BLE001
+                self._fail(rel, "Couldn't sync", e)
+        gone_dirs, self.gone_dirs = self.gone_dirs, []
+        for rel, R in gone_dirs:
+            try:
+                self.drive.trash(R["id"])                      # deleted on PC (moved files went out first)
+                self.stats["trashed"] += 1
+                self._emit("trashed", rel, "Deleted on this PC")
+                self._forget(rel)
+            except Exception as e:  # noqa: BLE001
+                self._fail(rel, "Couldn't sync", e)
+
     # -- parallel downloads ---------------------------------------------------------------
     def _queue_download(self, R: dict, rel: str, path: Path, message: str, sig: tuple[int, int] | None):
         """Start downloading in the background (up to `parallel` at once). Everything that
@@ -541,6 +659,8 @@ class TwoWaySyncer:
         sig: the PC copy's (size, modified time) when the download was decided (None: no PC copy).
         If it's saved meanwhile, the download isn't used - the next sync sees both sides changed."""
         size = int(R.get("size") or 0)
+        self._check_full("download")
+        self._check_disk(size)
 
         def still_as_decided():
             if _sig(path) != sig:
@@ -568,7 +688,7 @@ class TwoWaySyncer:
 
     def _finish_downloads(self, wait: bool = True) -> None:
         """Record finished downloads (state, Activity, progress). wait=False: only the ones already done."""
-        still = []
+        still, paused = [], False
         for fut, (rel, path, R, message, size) in self.pending:
             if not wait and not fut.done():
                 still.append((fut, (rel, path, R, message, size)))
@@ -578,6 +698,9 @@ class TwoWaySyncer:
                 self.stats["downloaded"] += 1
                 self._emit("downloaded", rel, message)
                 self._remember_file(rel, R["id"], R["md5Checksum"], got)
+            except Paused:      # not recorded: it's downloaded again when syncing resumes
+                paused = True
+                continue
             except ChangedOnPC:
                 log.info("%s was saved on this PC while Drive's version was downloading - kept yours", rel)
                 self.stats["skipped"] += 1
@@ -589,6 +712,8 @@ class TwoWaySyncer:
                 if self.progress:
                     self.progress.file_done(size)
         self.pending = still
+        if paused:
+            raise Paused()
 
     def _conflict(self, R: dict, rel: str, path: Path, remote_id: str, rmd5: str) -> None:
         """Edited on both sides: Drive's version keeps the name, the PC version is kept beside it."""

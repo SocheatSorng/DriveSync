@@ -75,6 +75,14 @@ class FakeDrive:
             before_replace()
         Path(dest).write_bytes(self.items[fid]["content"])
 
+    def move(self, fid, name, parent):
+        self.moves = getattr(self, "moves", []) + [(self.items[fid]["name"], name)]
+        old = self.items[fid].get("parent")
+        self.items[fid].update(name=name, parent=parent)
+        self._touch(fid)
+        if old:
+            self.changes.add(old)
+
     def trash(self, fid):
         self.items[fid]["trashed"] = True
         self._touch(fid)

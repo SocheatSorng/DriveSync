@@ -28,6 +28,7 @@ Safety:
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -177,7 +178,14 @@ def download(creds, file_id: str, dest: Path, *, prefix: str, expected_md5: str 
             log.info("Server won't send %s in parts - downloading it in one piece", dest.name)
             tmp.unlink(missing_ok=True)
             record.unlink(missing_ok=True)
-            _download_stream(creds, file_id, dest, tmp, on_bytes, retries, session, sleep, limiter)
+            try:
+                _download_stream(creds, file_id, dest, tmp, on_bytes, retries, session, sleep, limiter)
+            except OSError as e:
+                _drop_part_if_disk_full(e, tmp, record)
+                raise
+        except OSError as e:
+            _drop_part_if_disk_full(e, tmp, record)
+            raise
         if expected_md5 and _md5(tmp) != expected_md5:
             tmp.unlink(missing_ok=True)
             record.unlink(missing_ok=True)
@@ -195,6 +203,18 @@ def download(creds, file_id: str, dest: Path, *, prefix: str, expected_md5: str 
         os.replace(tmp, dest)
         record.unlink(missing_ok=True)
         return
+
+
+def _drop_part_if_disk_full(e: OSError, tmp: Path, record: Path) -> None:
+    """Disk full: delete the half-downloaded file so it doesn't keep taking the space that's short."""
+    if is_disk_full(e):
+        tmp.unlink(missing_ok=True)
+        record.unlink(missing_ok=True)
+
+
+def is_disk_full(e: BaseException) -> bool:
+    """True for "the disk is full" (on Windows also "not enough space on the disk")."""
+    return isinstance(e, OSError) and (e.errno == errno.ENOSPC or getattr(e, "winerror", None) in (39, 112))
 
 
 def _retry_wait(e: Exception, attempt: int, retries: int, name: str, sleep) -> None:

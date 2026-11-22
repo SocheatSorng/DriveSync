@@ -30,10 +30,11 @@ import accounts
 import activity
 import browsers
 import logo
+import metered
 from downloader import PARALLEL
 from downloader import apply_settings as apply_network_settings
 from drive_sync import APP_DIR, DEFAULT_EXCLUDES, RESOURCE_DIR, Drive, build_service, sync_folder
-from progress import Progress, count_files
+from progress import Paused, Progress, count_files, human_size
 from watcher import ChangeTracker, FolderWatcher
 
 CONFIG_PATH = APP_DIR / "config.json"
@@ -60,10 +61,15 @@ DEFAULT_CONFIG = {
     "high_priority": False,    # big downloads use 4 connections -> bigger share when other apps are busy
     "speed_limit_kbps": 0,     # cap on Drive Sync's combined speed in KB/s (0 = no limit)
     "notify_on_changes": False,
+    "pause_on_metered": False,  # hold syncing on phone hotspots / metered Wi-Fi
     "appearance": "System",
     "folders": [],
 }
 log = logging.getLogger("drive_sync")
+METERED_STATUS = "Waiting - metered connection"
+FULL_RETRY_SECONDS = 30 * 60   # a full Drive / disk is tried again this often (or on "Sync now")
+QUOTA_MAX_AGE = 10 * 60        # how long an account's storage numbers are reused
+NEARLY_FULL = 0.9              # warn once an account's Drive is this full
 
 
 # --------------------------------------------------------------------------- #
@@ -84,8 +90,68 @@ ICONS = {
     "idle": make_icon(logo.GREEN),    # green  - up to date
     "syncing": make_icon("#ffb020"),  # amber  - working
     "error": make_icon("#ff4d4f"),    # red    - needs attention
-    "paused": make_icon("#8b949e"),   # grey   - paused
+    "paused": logo.draw_paused(tray_icon_size()),  # grey + pause badge - paused
 }
+SYNC_FRAMES = logo.draw_syncing_frames(tray_icon_size())  # amber + spinning badge - files moving
+FRAME_SECONDS = 0.125                                     # 8 frames a second: one turn a second
+
+
+def animations_enabled() -> bool:
+    """Windows' "Show animations in Windows" (Accessibility / Visual effects) setting."""
+    try:
+        on = ctypes.c_bool(True)
+        ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(on), 0)  # SPI_GETCLIENTAREAANIMATION
+        return bool(on.value)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+class TrayAnimation:
+    """Spins the tray icon while files are uploading or downloading.
+
+    Each frame's icon handle is made once and handed straight to Windows, so animating doesn't
+    write a temporary .ico file per frame (what setting pystray's icon.icon does)."""
+
+    def __init__(self, icon, frames: list[Image.Image]):
+        self.icon, self.frames = icon, frames
+        self.handles: list | None = None
+
+    def _load(self) -> list:
+        from pystray._util import serialized_image, win32
+        handles = []
+        for frame in self.frames:
+            with serialized_image(frame, "ICO") as path:
+                handles.append(win32.LoadImage(None, path, win32.IMAGE_ICON, 0, 0,
+                                               win32.LR_DEFAULTSIZE | win32.LR_LOADFROMFILE))
+        return handles
+
+    def show(self, i: int) -> None:
+        from pystray._util import win32
+        if self.handles is None:
+            self.handles = self._load()
+        self.icon._message(win32.NIM_MODIFY, win32.NIF_ICON, hIcon=self.handles[i % len(self.handles)])
+
+
+PAUSE_CHOICES = [("For 30 minutes", 30 * 60), ("For 1 hour", 3600), ("For 3 hours", 3 * 3600)]
+MORNING_HOUR = 7   # "until tomorrow morning" ends at 7:00
+
+
+def seconds_until(hour: int, now: float | None = None) -> float:
+    """Seconds from now until the next hour:00 (tomorrow's if today's has passed)."""
+    t = time.localtime(now if now is not None else time.time())
+    target = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, hour, 0, 0, 0, 0, -1))
+    if target <= time.mktime(t):
+        target = time.mktime((t.tm_year, t.tm_mon, t.tm_mday + 1, hour, 0, 0, 0, 0, -1))
+    return target - time.mktime(t)
+
+
+def quota_text(q: dict | None) -> str:
+    """'12.3 GB of 15.0 GB used (82%)' - or '' when unknown."""
+    if not q:
+        return ""
+    if not q.get("limit"):
+        return f"{human_size(q['usage'])} used"
+    return f"{human_size(q['usage'])} of {human_size(q['limit'])} used ({100 * q['usage'] // q['limit']}%)"
 
 
 def single_instance() -> bool:
@@ -102,11 +168,19 @@ class App:
         self.wake = threading.Event()
         self.stopping = threading.Event()
         self.paused = False
+        self.pause_until: float | None = None       # time.time() when a timed pause ends (None: until resumed)
+        self.metered_held = False                   # waiting: on a metered connection (setting on)
+        self.animating = False                      # the tray icon is spinning (TrayAnimation)
         self.state, self.status, self.detail = "idle", "Starting…", ""
         self.drives: dict[str, Drive] = {}          # email -> connected Drive (worker thread only)
         self.needs_signin: set[str] = set()         # accounts whose login expired / was revoked
         self.signing_in: str | None = None          # "new" or an email while the browser flow runs
         self.force_full = False                     # "Sync now" pressed
+        self.resume_full = False                    # a full check was paused part-way: finish it on resume
+        self.storage_full: dict[str, set[str]] = {}  # last sync: "drive" -> accounts, "pc" -> folders
+        self._full_notified: frozenset = frozenset()  # what the last "storage full" notification said
+        self.quota: dict[str, dict] = {}            # account -> {"limit", "usage", "at"} (Drive storage)
+        self._quota_warned: set[str] = set()        # accounts already warned about being nearly full
         self.activity = activity.ActivityStore(APP_DIR / "activity.jsonl")
         self.last_check: dict | None = None         # most recent sync, even if nothing changed
         self.progress: Progress | None = None       # set while a sync runs
@@ -147,7 +221,12 @@ class App:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open Drive Sync", lambda *_: self.ui.put(("show",)), default=True),
             pystray.MenuItem("Sync now", lambda *_: self.sync_now()),
-            pystray.MenuItem("Pause syncing", lambda *_: self.toggle_pause(), checked=lambda _: self.paused),
+            pystray.MenuItem("Resume syncing", lambda *_: self.resume(), visible=lambda _: self.paused),
+            pystray.MenuItem("Pause syncing", pystray.Menu(
+                *[pystray.MenuItem(label, lambda *_, s=secs: self.pause(s)) for label, secs in PAUSE_CHOICES],
+                pystray.MenuItem("Until tomorrow morning", lambda *_: self.pause(seconds_until(MORNING_HOUR))),
+                pystray.MenuItem("Until I resume", lambda *_: self.pause(None)),
+            ), visible=lambda _: not self.paused),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda *_: self.ui.put(("quit",))),
         ))
@@ -173,6 +252,7 @@ class App:
         log.info("Settings saved")
         self.refresh_watchers()  # folders / exclusions / instant-sync switch may have changed
         self.apply_network(cfg)
+        self.wake.set()          # e.g. "don't sync on metered connections" applies right away
 
     @staticmethod
     def apply_network(cfg: dict) -> None:
@@ -187,13 +267,42 @@ class App:
     def set_state(self, state: str, status: str, detail: str = "") -> None:
         self.state, self.status, self.detail = state, status, detail
         try:
-            self.icon.icon = ICONS["paused" if self.paused and state != "syncing" else state]
+            if not self.animating:   # while spinning, the animation thread owns the icon
+                self.icon.icon = self.static_icon()
             tip = f"Drive Sync - {status}" + (f"\n{detail}" if state == "syncing" and detail else "")
             self.icon.title = tip[:127]  # Windows tooltip limit
             self.icon.update_menu()
         except Exception as e:  # noqa: BLE001 - icon may not be running yet
             log.debug("Tray icon not ready: %s", e)
         self.ui.put(("state",))
+
+    def static_icon(self) -> Image.Image:
+        return ICONS["paused" if self.paused or self.metered_held else self.state]
+
+    def should_spin(self) -> bool:
+        """Spin only while files are actually moving (not while comparing), and not when paused."""
+        p = self.progress
+        return (self.state == "syncing" and not self.paused and not self.metered_held
+                and p is not None and bool(p.active))
+
+    def animate(self) -> None:
+        """Runs on its own thread for the life of the app."""
+        anim, frame, allowed, checked = TrayAnimation(self.icon, SYNC_FRAMES), 0, True, 0.0
+        while not self.stopping.is_set():
+            if time.monotonic() - checked > 10:      # the Windows setting can change while we run
+                allowed, checked = animations_enabled(), time.monotonic()
+            spin = allowed and self.should_spin()
+            try:
+                if spin:
+                    self.animating = True
+                    anim.show(frame)
+                    frame += 1
+                elif self.animating:
+                    self.animating = False
+                    self.icon.icon = self.static_icon()   # back to the still icon for the state
+            except Exception as e:  # noqa: BLE001 - icon not ready / gone: try again shortly
+                log.debug("Tray animation: %s", e)
+            self.stopping.wait(FRAME_SECONDS if spin else 0.25)
 
     def notify(self, msg: str) -> None:
         try:
@@ -225,29 +334,84 @@ class App:
         next_poll = time.monotonic()  # first poll: what changed on Drive while the app was off
         first = True
         while not self.stopping.is_set():
-            if not self.paused and time.monotonic() >= next_poll:
+            if self.paused and self.pause_until and time.time() >= self.pause_until:
+                self.resume()       # a timed pause is over
+                self.wake.clear()
+            self._check_metered()
+            held = self.paused or self.metered_held
+            if not held and time.monotonic() >= next_poll:
                 self._poll_drive()  # marks two-way folders whose Drive account has new changes
                 next_poll = time.monotonic() + self._poll_interval()
-            if not self.paused:
-                if self.force_full or time.monotonic() >= next_full:
+            if not held:
+                if self.force_full or self.resume_full or time.monotonic() >= next_full:
                     manual = self.force_full
                     trigger = "manual" if manual else "startup" if first else "scheduled"
-                    self.force_full, first = False, False
+                    self.force_full, self.resume_full, first = False, False, False
                     ok = self.sync_all(trigger=trigger, full=manual, scan=True)
-                    next_full = time.monotonic() + (self._interval() if ok else min(self._interval(), 120))
+                    next_full = time.monotonic() + (self._interval() if ok else
+                                                    min(self._interval(), self._retry_delay()))
                 else:
                     changed = self.changes.take_settled()
                     trigger = "drive" if changed and changed <= self.drive_marked else "changes"
                     self.drive_marked -= changed
                     if changed and not self.sync_all(only=changed, trigger=trigger):
-                        next_full = min(next_full, time.monotonic() + 120)  # retry soon
+                        next_full = min(next_full, time.monotonic() + self._retry_delay())
             # Sleep until the timer, the next settled change, or a wake-up (change / Sync now / quit).
-            due = [next_full, next_poll] if not self.paused else []
-            if not self.paused and (settle := self.changes.next_due()) is not None:
+            due = [next_full, next_poll] if not held else []
+            if self.paused and self.pause_until:
+                due.append(time.monotonic() + (self.pause_until - time.time()))
+            if self.metered_held:
+                due.append(time.monotonic() + metered.CHECK_EVERY)   # look again for a free connection
+            if not held and (settle := self.changes.next_due()) is not None:
                 due.append(settle)
             timeout = max(0.5, min(due) - time.monotonic()) if due else None
             self.wake.wait(timeout)
             self.wake.clear()
+
+    def _update_quota(self, email: str, drive) -> None:
+        """Refresh the account's Drive storage numbers (every few minutes), warn once when it's nearly
+        full, and tell the upload pre-check how much space is left."""
+        q = self.quota.get(email)
+        if not q or time.time() - q["at"] > QUOTA_MAX_AGE:
+            try:
+                q = {**drive.storage_quota(), "at": time.time()}
+            except Exception as e:  # noqa: BLE001 - only informative
+                log.debug("Couldn't read Drive storage for %s: %s", email, e)
+                drive.quota_free = None
+                return
+            self.quota[email] = q
+            self.ui.put(("account",))
+        limit, usage = q["limit"], q["usage"]
+        drive.quota_free = None if not limit else limit - usage
+        if limit and usage >= NEARLY_FULL * limit:
+            if email not in self._quota_warned:
+                self._quota_warned.add(email)
+                self.notify(f"Google Drive for {email} is {quota_text(q)}. Free up space soon so "
+                            "uploads keep working.")
+        else:
+            self._quota_warned.discard(email)
+
+    def _metered_hold(self) -> bool:
+        """Hold syncing now? (setting on, and Windows says the connection is metered)"""
+        return bool(self.cfg.get("pause_on_metered")) and metered.is_metered()
+
+    def _check_metered(self) -> None:
+        held = self._metered_hold()
+        if held == self.metered_held:
+            return
+        self.metered_held = held
+        if self.paused:
+            return
+        if held:
+            self.set_state("idle", METERED_STATUS, "Syncing carries on when you're on another network "
+                                                   "(Settings → Internet use)")
+        else:
+            self.set_state("idle", "Resuming…", "")
+
+    def _retry_delay(self) -> int:
+        """Seconds before a failed sync is tried again: soon, unless a side is full (that takes
+        someone freeing space - "Sync now" tries right away)."""
+        return FULL_RETRY_SECONDS if self.storage_full else 120
 
     def _poll_drive(self) -> None:
         """Ask Google (cheaply) what changed in each two-way account since last time. The changed
@@ -499,7 +663,8 @@ class App:
         if only is not None:
             folders = [f for f in folders if self.folder_key(f, known) in only]
 
-        totals = dict(uploaded=0, updated=0, trashed=0, downloaded=0, deleted_local=0, conflicts=0, errors=0)
+        full: dict[str, set[str]] = {}
+        totals = dict(uploaded=0, updated=0, moved=0, trashed=0, downloaded=0, deleted_local=0, conflicts=0, errors=0)
         # Decide per folder: only what changed, or every file.
         plans = []
         for f in folders:
@@ -516,7 +681,8 @@ class App:
             return True
         # Count files first so the UI can show a percentage and "file X of Y". A quick sync counts
         # the files of each folder it looks at as it goes.
-        prog = Progress(on_change=self._on_progress)
+        prog = Progress(on_change=self._on_progress,
+                        should_stop=lambda: self.paused or self.stopping.is_set() or self._metered_hold())
         counts = []
         for f, _key, _email, plan in plans:
             try:
@@ -527,10 +693,12 @@ class App:
         prog.add_total(sum(n for n, _ in counts), sum(b for _, b in counts))
         self.progress = prog
         for (f, key, email, plan), (n_files, n_bytes) in zip(plans, counts, strict=True):
-            if self.stopping.is_set() or self.paused:
+            if self.stopping.is_set() or self.paused or self._metered_hold():   # not done: keep for later
                 if plan:
-                    self.changes.mark(key, paths=plan["paths"])   # not done: keep for next time
-                break
+                    self.changes.mark(key, paths=plan["paths"])
+                else:
+                    self.resume_full = True
+                continue
             started_at = time.time()
             self.set_state("syncing", "Checking changes…" if plan else "Checking all files…",
                            f"{f['local']}  →  {email}")
@@ -546,6 +714,7 @@ class App:
                 if plan:
                     self.changes.mark(key, settle=120, paths=plan["paths"])  # try these again later
             else:
+                self._update_quota(email, drive)
                 try:
                     excludes = list(DEFAULT_EXCLUDES) + list(f.get("exclude", []))
                     s = sync_folder(drive, f["local"], drive_folder=f.get("drive_folder"),
@@ -557,7 +726,16 @@ class App:
                         self.remote_ids[(os.path.normcase(f["local"]), email)] = s["remote_id"]
                     for t in totals:
                         totals[t] += s.get(t, 0)
+                    for where in s.get("storage_full", ()):
+                        full.setdefault(where, set()).add(email if where == "drive" else f["local"])
                     self._synced(key, plan, s, started_at)
+                except Paused:
+                    # Stopped part-way: what finished is saved; the rest is done when syncing resumes.
+                    if plan:
+                        self.changes.mark(key, paths=plan["paths"])
+                    else:
+                        self.resume_full = True
+                    activity.add_item(run, "skipped", ".", "Paused - the rest syncs when you resume")
                 except Exception as e:  # noqa: BLE001
                     log.error("Sync of %s (%s) failed: %s", f["local"], email, e)
                     totals["errors"] += 1
@@ -575,12 +753,20 @@ class App:
         self.file_lines, self.menu_file_lines = [], []
 
         when = time.strftime("%H:%M")
-        changes = sum(totals[k] for k in ("uploaded", "updated", "trashed", "downloaded", "deleted_local",
+        self.storage_full = full
+        changes = sum(totals[k] for k in ("uploaded", "updated", "moved", "trashed", "downloaded", "deleted_local",
                                           "conflicts"))
         self.last_check = {"ts": time.time(), "trigger": trigger, "folders": len(folders),
                            "changes": changes, "errors": totals["errors"]}
         self.ui.put(("last_check",))
-        parts = [(totals["uploaded"], "uploaded"), (totals["updated"], "updated"),
+        if self.paused and not totals["errors"] and not self.needs_signin:
+            self.set_state("idle", self.pause_label(), f"Stopped at {when} - the rest syncs when you resume")
+            return True
+        if not self.paused and self._metered_hold():
+            self.metered_held = True
+            self.set_state("idle", METERED_STATUS, f"Stopped at {when} - the rest syncs on another network")
+            return True
+        parts = [(totals["uploaded"], "uploaded"), (totals["updated"], "updated"), (totals["moved"], "moved"),
                  (totals["downloaded"], "downloaded"), (totals["deleted_local"], "to Recycle Bin"),
                  (totals["trashed"], "to Drive trash"), (totals["conflicts"], "conflicts kept")]
         summary = ", ".join(f"{n} {label}" for n, label in parts if n)
@@ -589,6 +775,10 @@ class App:
             self.set_state("error", "Sign in again needed", f"{who} - open Settings → Google accounts")
             self.notify(f"Sign in again to keep syncing: {who}")
             return False
+        if full:
+            self._report_full(full, when)
+            return False
+        self._full_notified = frozenset()
         if totals["errors"]:
             self.set_state("error", f"{totals['errors']} problem(s) during sync",
                            f"Last sync {when} - see the Activity tab")
@@ -601,6 +791,25 @@ class App:
             self.notify(f"Synced: {summary}")
         return True
 
+    def _report_full(self, full: dict[str, set[str]], when: str) -> None:
+        """One clear status for a full Drive / disk; notify only when that's news (not every retry)."""
+        bits, notes = [], []
+        if "drive" in full:
+            who = ", ".join(sorted(full["drive"]))
+            bits.append(f"Google Drive storage is full ({who})")
+            notes.append(f"Google Drive storage is full for {who}. New files won't upload until you free "
+                         "up space on Drive or get more storage.")
+        if "pc" in full:
+            bits.append("This PC's disk is full")
+            notes.append("This PC's disk is full. Files from Drive won't download until you free up space.")
+        status = " · ".join(bits)
+        self.set_state("error", status, f"Last sync {when} - free up space, then press Sync now "
+                                        f"(tried again every {FULL_RETRY_SECONDS // 60} min)")
+        key = frozenset((w, x) for w, xs in full.items() for x in xs)
+        if key != self._full_notified:
+            self._full_notified = key
+            self.notify(" ".join(notes))
+
     def _synced(self, key, plan: dict | None, stats: dict, started_at: float) -> None:
         """Update the saved state after a folder synced: its Drive changes are handled now (unless
         something failed - then they're looked at again), and when it was last fully checked."""
@@ -611,7 +820,8 @@ class App:
             # Keep the Drive changes; the PC side is found again by the size/time comparison
             # (a file that failed isn't recorded as synced).
             if plan:
-                self.changes.mark(key, settle=120, paths=plan["paths"])
+                self.changes.mark(key, settle=FULL_RETRY_SECONDS if stats.get("storage_full") else 120,
+                                  paths=plan["paths"])
         else:
             handled = set(plan["ids"]) if plan else set(self.sync_state["pending"].get(k, ()))
             left = set(self.sync_state["pending"].get(k, ())) - handled
@@ -628,13 +838,37 @@ class App:
         self.wake.set()
 
     def toggle_pause(self):
-        self.paused = not self.paused
-        if self.state != "syncing":
-            self.set_state("idle", "Paused" if self.paused else "Resuming…", "")
+        """The window's Pause / Resume button."""
+        if self.paused:
+            self.resume()
         else:
-            self.ui.put(("state",))
-        if not self.paused:
-            self.wake.set()
+            self.pause(None)
+
+    def pause(self, seconds: float | None) -> None:
+        """Pause syncing - for `seconds`, or until resumed (None)."""
+        self.paused = True
+        self.pause_until = time.time() + seconds if seconds else None
+        self._show_pause_change()
+        self.wake.set()   # the worker sleeps until the pause ends
+
+    def resume(self) -> None:
+        self.paused, self.pause_until = False, None
+        self._show_pause_change()
+        self.wake.set()
+
+    def pause_label(self) -> str:
+        """'Paused', 'Paused until 15:30' or 'Paused until tomorrow 07:00'."""
+        if not self.pause_until:
+            return "Paused"
+        end = time.localtime(self.pause_until)
+        day = "" if end.tm_yday == time.localtime().tm_yday else "tomorrow "
+        return f"Paused until {day}{time.strftime('%H:%M', end)}"
+
+    def _show_pause_change(self) -> None:
+        if self.state != "syncing":
+            self.set_state("idle", self.pause_label() if self.paused else "Resuming…", "")
+        else:  # stops at the next file (or part-way through a big one); switch the icon now
+            self.set_state(self.state, self.status, self.detail)
 
     def credentials_ready(self) -> bool:
         return CREDS_PATH.exists()
@@ -649,7 +883,11 @@ class App:
         for e in known:  # logins from before full Drive access was needed
             if e not in self.needs_signin and not accounts.has_required_scopes(accounts.token_path(e)):
                 self.needs_signin.add(e)
-        return [{"email": e, "folders": counts[e], "needs_signin": e in self.needs_signin} for e in known]
+        def nearly_full(q):
+            return bool(q and q["limit"] and q["usage"] >= NEARLY_FULL * q["limit"])
+        return [{"email": e, "folders": counts[e], "needs_signin": e in self.needs_signin,
+                 "storage": quota_text(self.quota.get(e)), "nearly_full": nearly_full(self.quota.get(e))}
+                for e in known]
 
     def drive_for_browsing(self, email: str) -> Drive:
         """A separate Drive connection for the folder browser (called from its own thread)."""
@@ -770,6 +1008,7 @@ class App:
         self.refresh_watchers()
         threading.Thread(target=self.worker, daemon=True).start()
         self.icon.run_detached()
+        threading.Thread(target=self.animate, daemon=True, name="tray-animation").start()
         self.root.after(150, self.window.poll)
         self.root.mainloop()
 

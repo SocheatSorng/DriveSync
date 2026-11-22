@@ -23,6 +23,7 @@ import logging
 import mimetypes
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -45,9 +46,65 @@ RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 CHUNK = 8 * 1024 * 1024
 DOWNLOAD_PREFIX = "~drivesync-"   # in-progress downloads (two-way sync); never synced
 DEFAULT_EXCLUDES = ["desktop.ini", "Thumbs.db", ".DS_Store", "~$*", "*.tmp", "*.crdownload", "*.part",
-                    f"{DOWNLOAD_PREFIX}*"]
+                    f"{DOWNLOAD_PREFIX}*",
+                    # Left by Macs (zip files made on a Mac, copies from a Mac drive): useless on Windows.
+                    "__MACOSX", "._*", ".Spotlight-V100", ".Trashes", ".fseventsd"]
 
 log = logging.getLogger("drive_sync")
+
+
+class ResumableUploads:
+    """Big uploads that were stopped part-way (pause, quit, restart, lost connection): Google's link
+    to each one, so the next try carries on where it stopped instead of sending the file again.
+    A link is only used for the same file, unchanged (size and modified time), going to the same place.
+    Google keeps them for about a week; older ones are forgotten."""
+
+    MAX_AGE = 6 * 24 * 3600
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.links: dict[str, dict] | None = None
+
+    @staticmethod
+    def key(action: str, target: str, path: Path) -> str:
+        st = path.stat()
+        return f"{action}|{target}|{os.path.normcase(str(path))}|{st.st_size}|{st.st_mtime_ns}"
+
+    def _load(self) -> dict[str, dict]:
+        if self.links is None:
+            try:
+                self.links = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self.links = {}
+            now = time.time()
+            self.links = {k: v for k, v in self.links.items() if now - v.get("at", 0) < self.MAX_AGE}
+        return self.links
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self.links), encoding="utf-8")
+        except OSError as e:
+            log.debug("Couldn't save upload links: %s", e)
+
+    def get(self, key: str) -> str | None:
+        with self.lock:
+            return self._load().get(key, {}).get("uri")
+
+    def put(self, key: str, uri: str) -> None:
+        with self.lock:
+            links = self._load()
+            if links.get(key, {}).get("uri") != uri:
+                links[key] = {"uri": uri, "at": time.time()}
+                self._save()
+
+    def drop(self, key: str) -> None:
+        with self.lock:
+            if self._load().pop(key, None) is not None:
+                self._save()
+
+
+RESUMABLE = ResumableUploads(APP_DIR / "uploads.json")
 
 
 # --------------------------------------------------------------------------- #
@@ -102,6 +159,8 @@ class Drive:
         self.s = service
         self.retries = retries
         self.on_transfer = None  # on_transfer(fraction 0..1) while a big file uploads/downloads
+        self.quota_free: int | None = None  # Drive space left (set per sync; None: unknown / shared drive)
+        self._shared: dict[str, bool] = {}
 
     def _exec(self, request):
         return request.execute(num_retries=self.retries)
@@ -144,32 +203,93 @@ class Drive:
         return MediaFileUpload(str(path), mimetype=mime, resumable=size > 5 * 1024 * 1024,
                                chunksize=chunk)
 
-    def _send(self, request, media) -> dict:
+    def _send(self, make_request, media, key: str | None = None) -> dict:
         """Run an upload; big (resumable) uploads go in pieces and report progress after each.
-        Every piece counts towards the speed limit (Settings)."""
+        Every piece counts towards the speed limit (Settings). A big upload stopped part-way is
+        carried on from where it stopped next time (see ResumableUploads)."""
+        from googleapiclient.errors import HttpError
+
         from downloader import LIMIT
+        request = make_request()
         if not media.resumable():
             response = self._exec(request)
             LIMIT.consume(media.size() or 0)
             return response
+        uri = RESUMABLE.get(key) if key else None
+        if uri:
+            request.resumable_uri = uri
+            request._in_error_state = True   # first asks Google how much it already has
+            try:
+                return self._send_pieces(request, media, key)
+            except HttpError as e:
+                if getattr(e.resp, "status", None) not in (400, 404, 410):
+                    raise
+                log.info("Google no longer has the started upload of %s - sending it from the start", key)
+                RESUMABLE.drop(key)
+                request = make_request()
+        return self._send_pieces(request, media, key)
+
+    def _send_pieces(self, request, media, key: str | None) -> dict:
+        from downloader import LIMIT
         response, sent = None, 0
+        resumed = request.resumable_uri is not None
         while response is None:
             status, response = request.next_chunk(num_retries=self.retries)
             now = status.resumable_progress if status else (media.size() or sent)
+            if resumed:            # what Google already had isn't sent again (counted roughly)
+                resumed, sent = False, now
+                if now:
+                    log.info("Carried on a stopped upload (now at %.0f%%)", 100 * now / (media.size() or 1))
             LIMIT.consume(max(0, now - sent))
             sent = now
+            if key and request.resumable_uri:
+                RESUMABLE.put(key, request.resumable_uri)
             if status and self.on_transfer:
                 self.on_transfer(status.progress())
+        if key:
+            RESUMABLE.drop(key)
         return response
 
+    def storage_quota(self) -> dict:
+        """{"limit": bytes or None (unlimited), "usage": bytes} for the account."""
+        q = self._exec(self.s.about().get(fields="storageQuota(limit, usage)"))["storageQuota"]
+        return {"limit": int(q["limit"]) if q.get("limit") else None, "usage": int(q.get("usage") or 0)}
+
+    def in_shared_drive(self, folder_id: str) -> bool:
+        """Shared drives have their own storage: files there don't use the account's space."""
+        if folder_id not in self._shared:
+            f = self._exec(self.s.files().get(fileId=folder_id, fields="driveId", **self.ALL))
+            self._shared[folder_id] = bool(f.get("driveId"))
+        return self._shared[folder_id]
+
+    def _check_space(self, path: Path) -> None:
+        if self.quota_free is None:
+            return
+        size = path.stat().st_size
+        if size > self.quota_free:
+            from progress import human_size
+            raise NotEnoughSpace(f"Not enough Google Drive space for this file ({human_size(size)}; "
+                                 f"{human_size(max(0, self.quota_free))} free)")
+        self.quota_free -= size
+
     def upload(self, path: Path, parent_id: str) -> str:
+        self._check_space(path)
         meta = {"name": path.name, "parents": [parent_id]}
         media = self._media(path)
-        return self._send(self.s.files().create(body=meta, media_body=media, fields="id", **self.ALL), media)["id"]
+        return self._send(lambda: self.s.files().create(body=meta, media_body=media, fields="id", **self.ALL),
+                          media, ResumableUploads.key("upload", parent_id, path))["id"]
 
     def update(self, file_id: str, path: Path) -> None:
+        self._check_space(path)   # Drive keeps the old version for a while, so it all counts
         media = self._media(path)
-        self._send(self.s.files().update(fileId=file_id, media_body=media, fields="id", **self.ALL), media)
+        self._send(lambda: self.s.files().update(fileId=file_id, media_body=media, fields="id", **self.ALL),
+                   media, ResumableUploads.key("update", file_id, path))
+
+    def move(self, file_id: str, name: str, parent_id: str) -> None:
+        """Rename and/or move a file on Drive (instead of uploading it again under its new name)."""
+        parents = self._exec(self.s.files().get(fileId=file_id, fields="parents", **self.ALL)).get("parents", [])
+        extra = {} if parents == [parent_id] else {"addParents": parent_id, "removeParents": ",".join(parents)}
+        self._exec(self.s.files().update(fileId=file_id, body={"name": name}, fields="id", **extra, **self.ALL))
 
     def trash(self, file_id: str) -> None:
         self._exec(self.s.files().update(fileId=file_id, body={"trashed": True}, fields="id", **self.ALL))
@@ -250,6 +370,71 @@ class Drive:
 # --------------------------------------------------------------------------- #
 # Sync logic
 # --------------------------------------------------------------------------- #
+DEFERRED = object()  # _sync_file() result: a new file, sent at the end (it may turn out to be a move)
+
+
+class NotEnoughSpace(Exception):
+    """This one file doesn't fit in the space left (smaller files may still fit)."""
+
+
+class StorageFull(Exception):
+    """Raised instead of trying a transfer once this sync knows that side is full ("drive" or "pc")."""
+
+    def __init__(self, where: str):
+        super().__init__(f"{where} storage is full")
+        self.where = where
+
+
+FULL_MESSAGES = {
+    "drive": "Google Drive storage is full - nothing more can be uploaded. Free up space on Drive (or get "
+             "more storage); the rest is uploaded at the next sync after that.",
+    "pc": "This PC's disk is full - nothing more can be downloaded. Free up space on the disk; the rest "
+          "is downloaded at the next sync after that.",
+}
+
+
+def storage_full(e: BaseException) -> str | None:
+    """"drive" if Google refused because the account's storage is full, "pc" if this PC's disk is full."""
+    if isinstance(e, StorageFull):
+        return e.where
+    from downloader import is_disk_full
+    if is_disk_full(e):
+        return "pc"
+    if getattr(getattr(e, "resp", None), "status", None) == 403:
+        content = getattr(e, "content", b"") or b""
+        text = (content.decode("utf-8", "replace") if isinstance(content, bytes) else str(content)) + str(e)
+        if "storageQuotaExceeded" in text or "storage quota has been exceeded" in text.lower():
+            return "drive"
+    return None
+
+
+class StorageFullMixin:
+    """Shared by both sync engines: report a full Drive / disk once, then skip what can't work."""
+    full: set[str]
+
+    def _check_full(self, action: str) -> None:
+        """Before a transfer: don't even try one that can't work any more in this sync."""
+        if action in ("upload", "update") and "drive" in self.full:
+            raise StorageFull("drive")
+        if action == "download" and "pc" in self.full:
+            raise StorageFull("pc")
+
+    def _fail_full(self, rel: str, e: BaseException) -> bool:
+        """If e is "storage full": report it (once per sync and side) and return True."""
+        where = storage_full(e)
+        if not where:
+            return False
+        if where in self.full:
+            self.stats["skipped"] += 1
+            return True
+        self.full.add(where)
+        self.stats["storage_full"] = sorted(self.full)
+        self.stats["errors"] += 1
+        log.error("%s (at %s): %s", FULL_MESSAGES[where], rel or str(self.local_root), e)
+        self._emit("error", rel or ".", FULL_MESSAGES[where])
+        return True
+
+
 def md5_of(path: Path) -> str:
     h = hashlib.md5(usedforsecurity=False)  # matches Drive's md5Checksum; not used for security
     with open(path, "rb") as f:
@@ -258,7 +443,7 @@ def md5_of(path: Path) -> str:
     return h.hexdigest()
 
 
-class Syncer:
+class Syncer(StorageFullMixin):
     def __init__(self, drive, local_root: Path, remote_root_id: str | None, *,
                  excludes: list[str], delete: bool = False, dry_run: bool = False,
                  state_path: Path | None = None, on_event=None, progress=None):
@@ -280,7 +465,14 @@ class Syncer:
             except (OSError, ValueError):
                 log.warning("Ignoring unreadable state file %s", state_path)
         self.new_cache: dict[str, dict] = {}
-        self.stats = dict(uploaded=0, updated=0, unchanged=0, folders=0, trashed=0, skipped=0, errors=0)
+        self.stats = dict(uploaded=0, updated=0, unchanged=0, folders=0, trashed=0, skipped=0, errors=0, moved=0)
+        self.full: set[str] = set()   # "drive" once Google says the account's storage is full
+        # With delete: new files and what's to be trashed wait until the end, so a file that was
+        # renamed or moved on this PC is moved on Drive too instead of being uploaded again.
+        self.can_move = delete and not dry_run and hasattr(drive, "move")
+        self.new_files: list = []     # (path, rel, st, parent_id)
+        self.to_trash: list = []      # (Drive item, rel)
+        self._by_size: dict[int, list[str]] | None = None
 
     # -- helpers ---------------------------------------------------------- #
     def _excluded(self, name: str, rel: str) -> bool:
@@ -302,6 +494,7 @@ class Syncer:
 
     def _xfer(self, action: str, rel: str, size: int, fn, *args):
         """Run an upload/update and show it as the current transfer."""
+        self._check_full(action)
         if self.progress:
             self.progress.transfer(action, rel.replace(os.sep, "/"), size)
         try:
@@ -319,6 +512,8 @@ class Syncer:
                 log.debug("Activity hook failed: %s", e)
 
     def _fail(self, rel: str, what: str, e: Exception) -> None:
+        if self._fail_full(rel, e):
+            return
         log.error("%s %s: %s", what, rel or str(self.local_root), e)
         self.stats["errors"] += 1
         self._emit("error", rel or ".", f"{what}: {e}")
@@ -328,6 +523,7 @@ class Syncer:
         start = time.monotonic()
         try:
             self._sync_dir(self.local_root, self.remote_root_id, "")
+            self._settle_moves()
         finally:
             if self.state_path and not self.dry_run:
                 self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -375,10 +571,12 @@ class Syncer:
                     self._sync_dir(Path(entry.path), folder_id, rel)
                 elif entry.is_file():
                     st = entry.stat()
+                    deferred = False
                     try:
-                        self._sync_file(Path(entry.path), rel, st, existing, remote_id, kept_ids)
+                        deferred = self._sync_file(Path(entry.path), rel, st, existing, remote_id,
+                                                   kept_ids) is DEFERRED
                     finally:
-                        if self.progress:
+                        if self.progress and not deferred:
                             self.progress.file_done(st.st_size)
             except Exception as e:  # noqa: BLE001 - keep going on per-item failures
                 self._fail(rel, "Couldn't sync", e)
@@ -394,6 +592,9 @@ class Syncer:
                     continue
                 if item["mimeType"] != FOLDER_MIME and "md5Checksum" not in item:
                     continue  # native Google Doc/Sheet etc. - never created by us, leave it
+                if self.can_move:
+                    self.to_trash.append((item, rel))
+                    continue
                 try:
                     self._act(f"Trash          {rel}", self.drive.trash, item["id"])
                     self.stats["trashed"] += 1
@@ -401,15 +602,89 @@ class Syncer:
                 except Exception as e:  # noqa: BLE001
                     self._fail(rel, "Couldn't move to Drive trash", e)
 
+    def _upload_new(self, path: Path, rel: str, st: os.stat_result, parent_id: str | None) -> None:
+        self._act(f"Upload         {rel}", self._xfer, "upload", rel, st.st_size, self.drive.upload, path,
+                  parent_id)
+        self._local_md5(path, rel, st)  # prime cache
+        self.stats["uploaded"] += 1
+        self._emit("uploaded", rel)
+
+    def _could_be_moved(self, size: int) -> bool:
+        """Only a file the size of one that was synced last time and is now missing from its place
+        can be a rename / move; the rest upload right away."""
+        if size <= 0:
+            return False
+        if self._by_size is None:
+            self._by_size = {}
+            for rel, c in self.cache.items():
+                if c.get("size", 0) > 0:
+                    self._by_size.setdefault(c["size"], []).append(rel)
+        return any(not (self.local_root / r).exists() for r in self._by_size.get(size, ()))
+
+    def _drive_files_in(self, folder_id: str, rel_dir: str) -> list[tuple[dict, str]]:
+        """Every file under a Drive folder, with its path."""
+        out = []
+        for item in self.drive.list_children(folder_id):
+            rel = os.path.join(rel_dir, item["name"])
+            if item["mimeType"] == FOLDER_MIME:
+                out += self._drive_files_in(item["id"], rel)
+            elif "md5Checksum" in item:
+                out.append((item, rel))
+        return out
+
+    def _settle_moves(self) -> None:
+        """New files on this PC with the same content and size as one that's about to be trashed on
+        Drive were renamed or moved: move that Drive file instead of uploading again. Then trash the rest."""
+        if not (self.new_files or self.to_trash):
+            return
+        old: dict[tuple, list] = {}   # (md5, size) -> [(Drive item, old rel)]
+        for item, rel in self.to_trash:
+            try:
+                found = (self._drive_files_in(item["id"], rel) if item["mimeType"] == FOLDER_MIME
+                         else [(item, rel)])
+            except Exception as e:  # noqa: BLE001 - just no moves out of this folder
+                log.warning("Couldn't list %s on Drive: %s", rel, e)
+                found = []
+            for f, r in found:
+                old.setdefault((f["md5Checksum"], int(f.get("size") or -1)), []).append((f, r))
+        moved: set[str] = set()
+        for path, rel, st, parent_id in self.new_files:
+            try:
+                match = old.get((self._local_md5(path, rel, st), st.st_size)) if st.st_size else None
+                if match:
+                    item, old_rel = match.pop(0)
+                    self.drive.move(item["id"], path.name, parent_id)
+                    moved.add(item["id"])
+                    self.stats["moved"] += 1
+                    same_folder = os.path.dirname(old_rel) == os.path.dirname(rel)
+                    how = "Renamed on Drive too" if same_folder else "Moved on Drive too"
+                    self._emit("moved", rel, f"{how} (was {old_rel.replace(os.sep, '/')}) - not uploaded again")
+                else:
+                    self._upload_new(path, rel, st, parent_id)
+            except Exception as e:  # noqa: BLE001
+                self._fail(rel, "Couldn't sync", e)
+            finally:
+                if self.progress:
+                    self.progress.file_done(st.st_size)
+        for item, rel in self.to_trash:
+            if item["id"] in moved:
+                continue
+            try:
+                self._act(f"Trash          {rel}", self.drive.trash, item["id"])
+                self.stats["trashed"] += 1
+                self._emit("trashed", rel)
+            except Exception as e:  # noqa: BLE001
+                self._fail(rel, "Couldn't move to Drive trash", e)
+        self.new_files, self.to_trash = [], []
+
     def _sync_file(self, path: Path, rel: str, st: os.stat_result, existing: list[dict],
                    parent_id: str | None, kept_ids: set[str]) -> None:
         files = [i for i in existing if i["mimeType"] != FOLDER_MIME]
         if not files:
-            self._act(f"Upload         {rel}", self._xfer, "upload", rel, st.st_size, self.drive.upload, path,
-                      parent_id)
-            self._local_md5(path, rel, st)  # prime cache
-            self.stats["uploaded"] += 1
-            self._emit("uploaded", rel)
+            if self.can_move and self._could_be_moved(st.st_size):
+                self.new_files.append((path, rel, st, parent_id))
+                return DEFERRED
+            self._upload_new(path, rel, st, parent_id)
             return
         remote = files[0]
         kept_ids.add(remote["id"])  # extra duplicates with the same name are left to --delete
@@ -471,6 +746,13 @@ def sync_folder(drive: Drive, local_folder: str, *, drive_folder: str | None = N
     log.info("Syncing %s  %s  Google Drive:%s", local_root, "<->" if mode == "two_way" else "->",
              drive_folder_id or target)
     state = APP_DIR / "state" / f"{key}.json"
+    if getattr(drive, "quota_free", None) is not None and remote_root:
+        try:
+            if drive.in_shared_drive(remote_root):
+                drive.quota_free = None
+        except Exception as e:  # noqa: BLE001 - only a pre-check: Google still says no if it's full
+            log.debug("Couldn't tell whether %s is on a shared drive: %s", remote_root, e)
+            drive.quota_free = None
     if hasattr(drive, "on_transfer") and progress:
         drive.on_transfer = progress.transfer_fraction
     try:

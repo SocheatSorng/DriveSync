@@ -19,6 +19,13 @@ import threading
 import time
 from collections.abc import Callable
 
+
+class Paused(BaseException):
+    """Raised inside a sync when the user pauses (or quits): the sync stops at the next file, or part-way
+    through a big transfer. A BaseException so the engines' per-file `except Exception` lets it through;
+    what was finished is saved, the rest is done when syncing resumes."""
+
+
 VERBS = {"upload": "Uploading", "update": "Updating", "download": "Downloading"}
 
 
@@ -54,8 +61,10 @@ def human_size(n: float) -> str:
 
 class Progress:
     def __init__(self, on_change: Callable[[Progress], None] | None = None, min_interval: float = 0.3,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, should_stop: Callable[[], bool] | None = None):
         self.on_change, self.min_interval, self.clock = on_change, min_interval, clock
+        self.should_stop = should_stop  # True: the next transfer (or transfer piece) raises Paused
+        self.reading: str | None = None  # big file being read to see whether it changed
         self.lock = threading.Lock()
         self.total = 0          # files to look at (two-way adds files found only on Drive)
         self.done = 0           # files finished (most are just "unchanged")
@@ -95,7 +104,21 @@ class Progress:
             self.done_bytes += size
         self._changed()
 
+    def check(self) -> None:
+        """Raise Paused if syncing should stop now."""
+        if self.should_stop and self.should_stop():
+            raise Paused()
+
+    def read_start(self, path: str) -> None:
+        """A big file is being read (checksum) - shown instead of a bare "Checking files"."""
+        self.reading = path
+        self._changed(force=True)
+
+    def read_end(self) -> None:
+        self.reading = None
+
     def transfer(self, action: str, path: str, size: int = 0) -> None:
+        self.check()
         with self.lock:
             self.active[path] = {"action": action, "size": size, "got": 0, "started": self.clock()}
             self._last = path
@@ -103,6 +126,7 @@ class Progress:
 
     def transfer_fraction(self, fraction: float) -> None:
         """Progress of the most recent transfer as 0..1 (how uploads report)."""
+        self.check()
         with self.lock:
             t = self.active.get(self._last)
             if t:
@@ -111,6 +135,7 @@ class Progress:
 
     def transfer_bytes(self, path: str, got: int) -> None:
         """Bytes received so far for one transfer (how parallel downloads report)."""
+        self.check()
         with self.lock:
             t = self.active.get(path)
             if t:
@@ -169,11 +194,12 @@ class Progress:
         with self.lock:
             active = [{"path": k, **v} for k, v in self.active.items()]
             primary = self._primary()
-        if not active:
-            return "Checking files"
-
         def short(path, n=max_len):
             return path if len(path) <= n else "…" + path[-(n - 1):]
+
+        if not active:
+            reading = self.reading
+            return f"Checking {short(reading)}" if reading else "Checking files"
 
         if len(active) > 1:   # the files themselves are listed by file_lines()
             rate = self.speed()

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from drive_sync import DEFAULT_EXCLUDES, Syncer
-from progress import Progress, count_files, human_size
+from progress import Paused, Progress, count_files, human_size
 from test_drive_sync import FakeDrive
 from test_twoway import FakeDrive as FakeDrive2
 from twoway import TwoWaySyncer
@@ -155,6 +155,51 @@ class EngineHookTests(unittest.TestCase):
         TwoWaySyncer(drive, self.root, "root", excludes=DEFAULT_EXCLUDES, progress=p,
                      state_path=Path(self.tmp.name) / "s2.json", recycle=lambda x: None).run()
         self.assertEqual((p.total, p.done), (4, 4))
+
+    def _pause_after_first_upload(self, drive):
+        """A Progress that is 'paused' as soon as the first upload has finished."""
+        sent = []
+        orig = drive.upload
+        drive.upload = lambda path, parent: (sent.append(Path(path).name), orig(path, parent))[1]
+        return Progress(should_stop=lambda: bool(sent)), sent
+
+    def test_pause_stops_the_upload_engine_at_the_next_file(self):
+        drive = FakeDrive()
+        p, sent = self._pause_after_first_upload(drive)
+        with self.assertRaises(Paused):
+            Syncer(drive, self.root, "root", excludes=DEFAULT_EXCLUDES, progress=p,
+                   state_path=Path(self.tmp.name) / "s.json").run()
+        self.assertEqual(sent, ["a.txt"])
+        drive.upload = type(drive).upload.__get__(drive)  # resumed: the rest is sent, nothing twice
+        stats = Syncer(drive, self.root, "root", excludes=DEFAULT_EXCLUDES, progress=Progress(),
+                       state_path=Path(self.tmp.name) / "s.json").run()
+        self.assertEqual((stats["uploaded"], stats["unchanged"]), (2, 1))
+
+    def test_pause_stops_the_two_way_engine_and_resume_finishes(self):
+        drive = FakeDrive2()
+        drive.web_add("", "from-drive.txt", "d")
+        p, sent = self._pause_after_first_upload(drive)
+        state = Path(self.tmp.name) / "s2.json"
+        with self.assertRaises(Paused):
+            TwoWaySyncer(drive, self.root, "root", excludes=DEFAULT_EXCLUDES, progress=p,
+                         state_path=state, recycle=lambda x: None).run()
+        self.assertEqual(len(sent), 1)
+        drive.upload = type(drive).upload.__get__(drive)
+        stats = TwoWaySyncer(drive, self.root, "root", excludes=DEFAULT_EXCLUDES, progress=Progress(),
+                             state_path=state, recycle=lambda x: None).run()
+        self.assertEqual(stats["uploaded"] + len(sent), 3)
+        self.assertTrue((self.root / "from-drive.txt").exists())
+        names = sorted(i["name"] for i in drive.items.values() if i.get("parent") == "root")
+        self.assertEqual(names, ["a.txt", "b.txt", "from-drive.txt", "sub"])  # nothing uploaded twice
+
+    def test_pause_interrupts_a_big_transfer_part_way(self):
+        stop = []
+        p = Progress(should_stop=lambda: bool(stop))
+        p.transfer("upload", "big.mp4", 100)
+        p.transfer_fraction(0.3)
+        stop.append(1)
+        with self.assertRaises(Paused):
+            p.transfer_fraction(0.4)
 
 
 if __name__ == "__main__":

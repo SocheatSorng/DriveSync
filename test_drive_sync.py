@@ -40,11 +40,16 @@ class FakeDrive:
     def upload(self, path, parent_id):
         self.calls.append(("upload", path.name))
         return self._new(name=path.name, mimeType="application/octet-stream", parent=parent_id,
-                         md5Checksum=hashlib.md5(path.read_bytes()).hexdigest())
+                         md5Checksum=hashlib.md5(path.read_bytes()).hexdigest(), size=str(path.stat().st_size))
 
     def update(self, file_id, path):
         self.calls.append(("update", path.name))
-        self.items[file_id]["md5Checksum"] = hashlib.md5(path.read_bytes()).hexdigest()
+        self.items[file_id].update(md5Checksum=hashlib.md5(path.read_bytes()).hexdigest(),
+                                   size=str(path.stat().st_size))
+
+    def move(self, file_id, name, parent_id):
+        self.calls.append(("move", self.items[file_id]["name"], name))
+        self.items[file_id].update(name=name, parent=parent_id)
 
     def trash(self, file_id):
         self.calls.append(("trash", self.items[file_id]["name"]))

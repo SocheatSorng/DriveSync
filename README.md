@@ -16,7 +16,11 @@ In both modes:
 - New files are uploaded. Changed files are re-uploaded as a new revision of the same Drive file, and Drive keeps the old revisions. Unchanged files are skipped. Files are compared by MD5 checksum.
 - Subfolders are mirrored.
 - If you turn on **"Make Drive match this PC exactly"** for a folder (`--delete` on the command line), files in the Drive folder that aren't in the PC folder go to the **Drive trash**, where you can recover them for 30 days. That includes files that were already in a Drive folder you chose. Nothing is ever deleted permanently.
-- Large files use resumable uploads, and network errors are retried.
+- Large files use resumable uploads, and network errors are retried. A big upload stopped part-way (pause, quit, restart) carries on where it stopped, for up to about a week.
+- A file or folder you rename or move on this PC is renamed or moved on Drive too, not uploaded again (two-way folders, and upload-only folders with **Make Drive match this PC exactly**).
+- Pause from the tray for 30 minutes, 1 or 3 hours, until tomorrow morning, or until you resume. Pausing stops at the next file, or part-way through a big one.
+- Settings shows how much of each account's Drive storage is used, and warns at 90%. If Drive or this PC's disk is full, you get one clear message, the other direction keeps syncing, and the app tries again every 30 minutes (or on **Sync now**).
+- Optional: **Don't sync on metered connections** (Settings → Internet use) waits while you're on a phone hotspot or metered Wi-Fi.
 - It comes with a desktop window and a system-tray icon, and it can start automatically with Windows.
 
 ## 1. Google setup (once, about 5 minutes)
@@ -90,7 +94,7 @@ python drive_sync.py "D:\Photos" --drive-folder "Backup/Photos" --delete --dry-r
 | `--drive-folder-id ID` | Destination folder by ID instead of by path |
 | `--delete` | Trash Drive items that no longer exist locally |
 | `--exclude PATTERN` | Glob to skip, matched on the name or relative path (repeatable) |
-| `--no-default-excludes` | Also sync `desktop.ini`, `Thumbs.db`, `~$*`, `*.tmp`, and similar junk files |
+| `--no-default-excludes` | Also sync `desktop.ini`, `Thumbs.db`, `~$*`, `*.tmp`, Mac leftovers (`__MACOSX`, `._*`, `.DS_Store`) and similar junk files |
 | `--dry-run` | Only print what would happen |
 | `--watch SECONDS` | Loop forever, syncing every N seconds |
 | `--log-file FILE` | Also write the log to a file |
@@ -144,5 +148,5 @@ git push origin v1.0.0
 - **Permissions:** the app asks for full Google Drive access (the `drive` scope) so you can browse and sync into folders you created yourself, shared folders and shared drives. Google shows this as "See, edit, create, and delete all of your Google Drive files". Drive Sync only *changes* files inside the folders you choose. It only *reads* other folders to list them in the folder browser. Accounts added by older versions, which had the narrower `drive.file` permission, show **Sign in again** once.
 - **Upload only** folders: changes made on the Drive side are overwritten by the next sync if the local file differs. They are never downloaded. Use **Two-way** if you also work on Drive.
 - **Two-way** folders: Drive Sync remembers what both sides looked like after each sync, in `state\*.2way.json`. That's how it tells "deleted on Drive" apart from "new on this PC". A folder switched from upload-only to two-way reuses its earlier upload state, so files that were already backed up are recognised.
-- If you rename or move a file locally, the next sync uploads it under the new name. With **Make Drive match this PC exactly** turned on, the old copy is trashed.
+- If you rename or move a file locally in an **upload-only** folder without **Make Drive match this PC exactly**, the next sync uploads it under the new name and the old copy stays on Drive. With that option on (and in two-way folders), Drive's copy is renamed or moved instead. A file that was renamed *and* edited counts as a new file.
 - Files that are open or locked during a sync are logged as errors and retried next time.

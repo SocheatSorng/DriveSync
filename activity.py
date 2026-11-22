@@ -21,8 +21,9 @@ from pathlib import Path
 
 KEEP = 1000            # entries kept on disk
 MAX_ITEMS = 500        # files listed per run (the rest are only counted)
-KINDS = ("uploaded", "updated", "downloaded", "deleted_local", "trashed", "folder", "conflict", "skipped", "error")
-CHANGE_KINDS = ("uploaded", "updated", "downloaded", "deleted_local", "trashed", "folder", "conflict")
+KINDS = ("uploaded", "updated", "moved", "downloaded", "deleted_local", "trashed", "folder", "conflict", "skipped",
+         "error")
+CHANGE_KINDS = ("uploaded", "updated", "moved", "downloaded", "deleted_local", "trashed", "folder", "conflict")
 TRIGGERS = {"startup": "when Drive Sync started", "scheduled": "scheduled check",
             "changes": "after files changed", "drive": "after changes on Google Drive", "manual": "Sync now"}
 
@@ -74,7 +75,8 @@ def summary(entry: dict) -> str:
     if entry["type"] == "event":
         return entry.get("detail", "")
     c = entry["counts"]
-    labels = [("uploaded", "uploaded"), ("updated", "updated"), ("downloaded", "downloaded"),
+    labels = [("uploaded", "uploaded"), ("updated", "updated"), ("moved", "moved on Drive"),
+              ("downloaded", "downloaded"),
               ("deleted_local", "moved to Recycle Bin"), ("trashed", "moved to Drive trash"),
               ("folder", "new folder"), ("conflict", "conflict"), ("skipped", "skipped"), ("error", "problem")]
     parts = []

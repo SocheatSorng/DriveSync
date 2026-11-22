@@ -17,7 +17,8 @@ SECONDARY = {"fg_color": "transparent", "border_width": 1, "text_color": ("#1f1f
 RED, AMBER, GREEN, BLUE, GRAY = "#d93025", "#e37400", "#1e8e3e", "#1a73e8", "#80868b"
 BADGES = {  # kind: (label, color)
     "error": ("Problem", RED), "conflict": ("Conflict", AMBER), "skipped": ("Skipped", AMBER),
-    "uploaded": ("Uploaded", GREEN), "updated": ("Updated", BLUE), "downloaded": ("Downloaded", "#00838f"),
+    "uploaded": ("Uploaded", GREEN), "updated": ("Updated", BLUE), "moved": ("Moved", BLUE),
+    "downloaded": ("Downloaded", "#00838f"),
     "deleted_local": ("Recycle Bin", GRAY), "trashed": ("Drive trash", GRAY), "folder": ("New folder", "#9334e6"),
 }
 ORDER = list(BADGES)  # problems first in the details list

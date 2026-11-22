@@ -626,8 +626,17 @@ class MainWindow:
         limit_help = ctk.CTkLabel(net, text="Caps Drive Sync's total upload + download speed, to keep the rest of "
                                             "your internet free (e.g. for video calls). Applies immediately.",
                                   font=font(12), text_color=MUTED, anchor="w", justify="left")
-        limit_help.pack(anchor="w", padx=16, pady=(4, 14), fill="x")
+        limit_help.pack(anchor="w", padx=16, pady=(4, 10), fill="x")
         autowrap(limit_help, net, margin=40)
+        self.metered_var = tk.BooleanVar(value=bool(cfg.get("pause_on_metered")))
+        ctk.CTkSwitch(net, text="Don't sync on metered connections", variable=self.metered_var,
+                      command=self.save_options, font=font()).pack(anchor="w", padx=16, pady=(2, 0))
+        metered_help = ctk.CTkLabel(net, text="Waits while you're on a phone hotspot, mobile data or Wi-Fi set as "
+                                              "“metered” in Windows Settings, and carries on by itself on another "
+                                              "network. Stops at the next file if the connection changes mid-sync.",
+                                    font=font(12), text_color=MUTED, anchor="w", justify="left")
+        metered_help.pack(anchor="w", padx=16, pady=(4, 14), fill="x")
+        autowrap(metered_help, net, margin=40)
 
         look = card("Appearance")
         self.theme_btn = ctk.CTkSegmentedButton(look, values=["System", "Light", "Dark"],
@@ -648,7 +657,7 @@ class MainWindow:
     # ------------------------------------------------------------ refreshers
     def refresh_state(self):
         app = self.app
-        color = STATE_COLORS["paused" if app.paused and app.state != "syncing" else app.state]
+        color = STATE_COLORS["paused" if app.paused else app.state]
         self.dot.configure(text_color=color)
         self.status_lbl.configure(text=app.status)
         files = app.file_lines if app.state == "syncing" else []
@@ -756,8 +765,10 @@ class MainWindow:
             n = a["folders"]
             status = "Click “Sign in again” to keep syncing (needs updated access)" if a["needs_signin"] else (
                 f"{n} folder{'s' if n != 1 else ''}" if n else "No folders yet")
+            if a.get("storage") and not a["needs_signin"]:
+                status += f"  ·  Drive: {a['storage']}" + ("  -  nearly full" if a.get("nearly_full") else "")
             ctk.CTkLabel(r, text=status, font=font(12), anchor="w",
-                         text_color="#d93025" if a["needs_signin"] else MUTED).grid(
+                         text_color="#d93025" if a["needs_signin"] or a.get("nearly_full") else MUTED).grid(
                 row=1, column=1, sticky="w", pady=(0, 8))
             pr = ctk.CTkFrame(r, fg_color="transparent")
             pr.grid(row=2, column=1, columnspan=2, sticky="w", pady=(0, 10))
@@ -863,6 +874,7 @@ class MainWindow:
                    watch_changes=self.watch_var.get(),
                    drive_poll_seconds=POLLS.get(self.poll_menu.get(), 10),
                    high_priority=self.priority_btn.get() == "High",
+                   pause_on_metered=self.metered_var.get(),
                    speed_limit_kbps=LIMITS.get(self.limit_menu.get(), self.app.cfg.get("speed_limit_kbps", 0)))
         if cfg != self.app.cfg:
             self.app.save_config(cfg)
