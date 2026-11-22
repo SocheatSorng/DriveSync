@@ -24,12 +24,35 @@ import logging
 import os
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from downloader import PARALLEL
 from drive_sync import FOLDER_MIME, md5_of
 
 log = logging.getLogger("drive_sync")
 STATE_VERSION = 2
+PARALLEL_DOWNLOADS = PARALLEL  # one setting, shared with the tray menu's file lines
+QUEUED = object()  # _file() result: a download was started in the background
+SAVE_EVERY = 30.0  # seconds between saves of the sync state during a long sync
+
+
+class _Done:
+    """A finished 'future' for running a download synchronously (same interface as concurrent.futures)."""
+
+    def __init__(self, fn):
+        self._error = None
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 - re-raised by result()
+            self._error = e
+
+    def done(self) -> bool:
+        return True
+
+    def result(self):
+        if self._error:
+            raise self._error
 
 
 class DriveFolderGone(Exception):
@@ -77,8 +100,13 @@ def migration_base(local_root: Path, old_cache: dict, last_sync: float, excluded
 class TwoWaySyncer:
     def __init__(self, drive, local_root: Path, remote_root_id: str, *, excludes: list[str],
                  state_path: Path, migrate_from: Path | None = None, on_event=None, recycle=None,
-                 progress=None):
+                 progress=None, parallel: int = PARALLEL_DOWNLOADS):
         self.drive, self.local_root, self.root_id = drive, local_root, remote_root_id
+        self.parallel = max(1, parallel)  # downloads at once (measured ~4x faster for many small files)
+        self.pool: ThreadPoolExecutor | None = None
+        self.pending: list = []           # (future, job) of downloads not yet recorded
+        self.count_as_we_go = False       # quick sync: add each folder's files to the progress total
+        self._last_save = time.monotonic()
         self.excludes, self.state_path, self.on_event = excludes, state_path, on_event
         self.progress = progress  # progress.Progress - percentage / current file for the UI
         if recycle is None:
@@ -162,8 +190,96 @@ class TwoWaySyncer:
         # Google Docs/Sheets/Slides, shortcuts etc. have no file content to download.
         return item["mimeType"] == FOLDER_MIME or "md5Checksum" in item
 
+    # -- quick sync: find what changed --------------------------------------------
+    def _known_dir(self, rel: str) -> str | None:
+        """The deepest folder of `rel` that was synced before and still exists on this PC
+        ("" = the sync folder itself). None if that folder's Drive id isn't known (old state)."""
+        cur = ""
+        for part in [p for p in rel.split("/") if p and p != "."]:
+            match = next((n for n in self.children.get(cur, ()) if n.casefold() == part.casefold()
+                          and (self.base.get(_join(cur, n)) or {}).get("t") == "d"), None)
+            if match is None or not (self.local_root / _join(cur, match)).is_dir():
+                break
+            cur = _join(cur, match)
+        if cur and not self.base[cur].get("id"):
+            return None
+        return cur
+
+    def scan_local(self) -> set[str]:
+        """Folders whose contents on this PC differ from the last sync. Compares names, sizes and
+        modified times only (nothing is read), so it takes seconds even for many thousands of files."""
+        changed: set[str] = set()
+
+        def walk(rel_dir: str, path: str) -> None:
+            known = {n.casefold(): n for n in self.children.get(rel_dir, ())}
+            seen = set()
+            try:
+                entries = list(os.scandir(path))
+            except OSError:
+                changed.add(rel_dir)
+                return
+            for e in entries:
+                if e.is_symlink() or self._excluded(e.name, _join(rel_dir, e.name)):
+                    continue
+                key = e.name.casefold()
+                seen.add(key)
+                rel = _join(rel_dir, known.get(key, e.name))
+                b = self.base.get(rel) if key in known else None
+                try:
+                    is_dir = e.is_dir()
+                    if b is None or (b.get("t") == "d") != is_dir:
+                        changed.add(rel_dir)                       # new here, or file <-> folder
+                    elif is_dir:
+                        walk(rel, e.path)
+                    else:
+                        st = e.stat()
+                        if st.st_size != b.get("size") or st.st_mtime_ns != b.get("mtime_ns"):
+                            changed.add(rel_dir)
+                except OSError:
+                    changed.add(rel_dir)
+            if set(known) - seen:
+                changed.add(rel_dir)                               # something was deleted here
+
+        walk("", str(self.local_root))
+        return changed
+
+    def targets_for(self, paths=(), drive_ids=(), scan: bool = False) -> set[str] | None:
+        """The folders a quick sync has to look at, or None if everything must be checked
+        (first sync, or sync state from an older version)."""
+        if not self.base or any(b.get("t") == "d" and not b.get("id") for b in self.base.values()):
+            return None                     # never synced, or state from upload-only mode: check it all
+        found = set(self.scan_local()) if scan else set()
+        root = os.path.normcase(os.path.abspath(self.local_root))
+        for p in paths:                     # changed on this PC: look at the folder that holds it
+            ap = os.path.abspath(p)
+            if os.path.normcase(ap) == root:
+                found.add("")
+            elif os.path.normcase(ap).startswith(root + os.sep):
+                found.add(_parent(os.path.relpath(ap, self.local_root).replace(os.sep, "/")))
+        by_id = {b["id"]: rel for rel, b in self.base.items() if b.get("id")}
+        by_id[self.root_id] = ""
+        for i in drive_ids:                 # changed on Drive (files, and the folders holding them)
+            rel = by_id.get(i)
+            if rel is None:
+                continue                    # not in this sync folder (or new: its folder is listed too)
+            if rel == "":
+                found.add("")
+            else:
+                found.add(_parent(rel))     # renamed / moved / trashed: its folder sees that
+                if self.base[rel].get("t") == "d":
+                    found.add(rel)
+        targets = set()
+        for rel in found:
+            k = self._known_dir(rel)
+            if k is None:
+                return None
+            targets.add(k)
+        return targets
+
     # -- main ------------------------------------------------------------------
-    def run(self) -> dict:
+    def run(self, targets: set[str] | None = None) -> dict:
+        """Sync everything, or (targets) only those folders - each one's own files and subfolders;
+        a subfolder is only gone into when it is new or deleted on one side."""
         start = time.monotonic()
         status = self.drive.folder_status(self.root_id)
         if status != "ok":
@@ -171,18 +287,35 @@ class TwoWaySyncer:
                 "The Google Drive folder for this sync was deleted, moved to trash or is no longer "
                 "accessible - nothing on this PC was changed. Restore it on Drive, or choose another "
                 "Drive folder (Folders → Edit).")
+        self.count_as_we_go = targets is not None   # a full sync counted its files up front
         try:
-            self._dir(self.local_root, self.root_id, "")
+            with ThreadPoolExecutor(max_workers=self.parallel, thread_name_prefix="download") as pool:
+                self.pool = pool
+                try:
+                    if targets is None:
+                        self._dir(self.local_root, self.root_id, "")
+                    else:
+                        # Parents first: they may delete or replace a folder that is also listed.
+                        for rel in sorted(targets, key=lambda r: (r.count("/") if r else -1, r)):
+                            b = self.base.get(rel) if rel else {"t": "d", "id": self.root_id}
+                            path = self.local_root / rel if rel else self.local_root
+                            if not b or b.get("t") != "d" or not b.get("id") or not path.is_dir():
+                                continue            # already handled while syncing its parent
+                            self._dir(path, b["id"], rel, deep=False)
+                finally:
+                    self._finish_downloads(wait=True)   # record every download before saving state
         finally:
+            self.pool = None
             self._save()
         s = self.stats
-        log.info("Done in %.1fs (two-way): %d uploaded, %d updated, %d downloaded, %d to Recycle Bin, "
+        log.info("Done in %.1fs (two-way, %s): %d uploaded, %d updated, %d downloaded, %d to Recycle Bin, "
                  "%d to Drive trash, %d conflicts, %d unchanged, %d errors", time.monotonic() - start,
+                 "everything" if targets is None else f"{len(targets)} changed folder(s)",
                  s["uploaded"], s["updated"], s["downloaded"], s["deleted_local"], s["trashed"],
                  s["conflicts"], s["unchanged"], s["errors"])
         return s
 
-    def _dir(self, local_dir: Path, remote_id: str, rel_dir: str) -> None:
+    def _dir(self, local_dir: Path, remote_id: str, rel_dir: str, deep: bool = True) -> None:
         try:
             local = {}
             for e in os.scandir(local_dir):
@@ -199,17 +332,38 @@ class TwoWaySyncer:
             self._fail(rel_dir, "Couldn't read folder", e)
             return
         known = {n.casefold(): n for n in self.children.get(rel_dir, ())}
+        if self.count_as_we_go and self.progress:
+            sizes = []
+            for e in local.values():
+                try:
+                    if not e.is_dir():
+                        sizes.append(e.stat().st_size)
+                except OSError:
+                    sizes.append(0)
+            self.progress.add_total(len(sizes), sum(sizes))
 
         for key in sorted(set(local) | set(remote) | set(known)):
             L, R = local.get(key), remote.get(key)
             name = L.name if L else R["name"] if R else known[key]
             rel = _join(rel_dir, name)
             try:
-                self._item(L, R, self.base.get(rel), rel, local_dir, remote_id, name)
+                self._item(L, R, self.base.get(rel), rel, local_dir, remote_id, name, deep)
             except Exception as e:  # noqa: BLE001 - keep going with the other files
                 self._fail(rel, "Couldn't sync", e)
+            self._save_now_and_then()
 
-    def _item(self, L, R, B, rel, local_dir: Path, remote_id: str, name: str) -> None:
+    def _save_now_and_then(self) -> None:
+        """Save progress during a long sync, so a restart or crash doesn't lose it (each entry only
+        records an item that is the same on both sides, so a partly saved state is still correct)."""
+        now = time.monotonic()
+        if now - self._last_save >= SAVE_EVERY:
+            self._last_save = now
+            try:
+                self._save()
+            except OSError as e:
+                log.debug("Couldn't save sync progress: %s", e)
+
+    def _item(self, L, R, B, rel, local_dir: Path, remote_id: str, name: str, deep: bool = True) -> None:
         l_dir = L is not None and L.is_dir()
         r_dir = R is not None and R["mimeType"] == FOLDER_MIME
         if L is not None and R is not None and l_dir != r_dir:
@@ -217,14 +371,16 @@ class TwoWaySyncer:
             self._emit("skipped", rel, "A file and a folder have the same name on this PC and on Drive")
             return
         if l_dir or r_dir or (L is None and R is None and B and B.get("t") == "d"):
-            self._folder(L, R, B, rel, local_dir / name, remote_id, name)
+            self._folder(L, R, B, rel, local_dir / name, remote_id, name, deep)
         else:
             if L is None and R is not None and self.progress:
                 self.progress.add_total(1, int(R.get("size") or 0))  # on Drive only: not counted yet
+            queued = False
             try:
-                self._file(L, R, B, rel, local_dir / name, remote_id)
+                queued = self._file(L, R, B, rel, local_dir / name, remote_id) is QUEUED
             finally:
-                if self.progress and (L is not None or R is not None):
+                # A queued download is counted when it finishes (in _finish_downloads).
+                if self.progress and not queued and (L is not None or R is not None):
                     try:
                         size = L.stat().st_size if L is not None else int(R.get("size") or 0)
                     except OSError:  # e.g. just moved to the Recycle Bin
@@ -232,10 +388,11 @@ class TwoWaySyncer:
                     self.progress.file_done(size)
 
     # -- folders ------------------------------------------------------------------
-    def _folder(self, L, R, B, rel, path: Path, remote_id: str, name: str) -> None:
+    def _folder(self, L, R, B, rel, path: Path, remote_id: str, name: str, deep: bool = True) -> None:
         if L is not None and R is not None:
             self.base[rel] = {"t": "d", "id": R["id"]}
-            self._dir(path, R["id"], rel)
+            if deep or not B or B.get("t") != "d":   # quick sync: a known folder is checked only if listed
+                self._dir(path, R["id"], rel)
         elif L is not None:                                   # on PC only
             if B and not self._local_has_new(path, rel):
                 self.recycle(str(path))                       # deleted on Drive
@@ -312,10 +469,7 @@ class TwoWaySyncer:
                 self._emit("updated", rel)
                 self._remember_file(rel, R["id"], path, lmd5)
             elif r_changed and not l_changed:
-                self._xfer("download", rel, int(R.get("size") or 0), self.drive.download, R["id"], path)
-                self.stats["downloaded"] += 1
-                self._emit("downloaded", rel, "Changed on Google Drive")
-                self._remember_file(rel, R["id"], path, rmd5)
+                return self._queue_download(R, rel, path, "Changed on Google Drive")
             else:
                 self._conflict(R, rel, path, remote_id, rmd5)
         elif L is not None:                                    # on PC only
@@ -338,13 +492,54 @@ class TwoWaySyncer:
                 self._emit("trashed", rel, "Deleted on this PC")
                 self._forget(rel)
                 return
-            self._xfer("download", rel, int(R.get("size") or 0), self.drive.download, R["id"], path)
-            self.stats["downloaded"] += 1
-            self._emit("downloaded", rel, "Kept: deleted on this PC, but changed on Drive" if B
-                       else "New on Google Drive")
-            self._remember_file(rel, R["id"], path, rmd5)
+            return self._queue_download(R, rel, path, "Kept: deleted on this PC, but changed on Drive" if B
+                                        else "New on Google Drive")
         else:
             self._forget(rel)
+
+    # -- parallel downloads ---------------------------------------------------------------
+    def _queue_download(self, R: dict, rel: str, path: Path, message: str):
+        """Start downloading in the background (up to `parallel` at once). Everything that
+        changes the saved sync state happens later, back on this thread, in _finish_downloads."""
+        size = int(R.get("size") or 0)
+
+        def work():
+            if self.progress:
+                self.progress.transfer("download", rel, size)
+            try:
+                self.drive.download(R["id"], path, expected_md5=R["md5Checksum"], size=size,
+                                    on_bytes=(lambda got: self.progress.transfer_bytes(rel, got))
+                                    if self.progress else None)
+            finally:
+                if self.progress:
+                    self.progress.transfer_end(rel)
+
+        job = (rel, path, R, message, size)
+        if self.pool is None:                 # no pool (e.g. a single file): download right here
+            self.pending.append((_Done(work), job))
+        else:
+            self.pending.append((self.pool.submit(work), job))
+            self._finish_downloads(wait=False)
+        return QUEUED
+
+    def _finish_downloads(self, wait: bool = True) -> None:
+        """Record finished downloads (state, Activity, progress). wait=False: only the ones already done."""
+        still = []
+        for fut, (rel, path, R, message, size) in self.pending:
+            if not wait and not fut.done():
+                still.append((fut, (rel, path, R, message, size)))
+                continue
+            try:
+                fut.result()
+                self.stats["downloaded"] += 1
+                self._emit("downloaded", rel, message)
+                self._remember_file(rel, R["id"], path, R["md5Checksum"])
+            except Exception as e:  # noqa: BLE001 - the other downloads carry on
+                self._fail(rel, "Couldn't download", e)
+            finally:
+                if self.progress:
+                    self.progress.file_done(size)
+        self.pending = still
 
     def _conflict(self, R: dict, rel: str, path: Path, remote_id: str, rmd5: str) -> None:
         """Edited on both sides: Drive's version keeps the name, the PC version is kept beside it."""
@@ -352,7 +547,9 @@ class TwoWaySyncer:
         keep = path.with_name(f"{path.stem} (conflict {stamp} PC){path.suffix}")
         os.replace(path, keep)
         try:
-            self._xfer("download", rel, int(R.get("size") or 0), self.drive.download, R["id"], path)
+            self._xfer("download", rel, int(R.get("size") or 0),
+                       lambda: self.drive.download(R["id"], path, expected_md5=rmd5,
+                                                   size=int(R.get("size") or 0) or None))
         except Exception:
             os.replace(keep, path)  # put the PC version back; try again next time
             raise

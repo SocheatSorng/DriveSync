@@ -64,11 +64,8 @@ class Progress:
         self.folder = ""        # PC folder being synced
         self._folder_start = self._folder_total = 0
         self._folder_start_bytes = self._folder_bytes = 0
-        self.action = None      # "upload" | "update" | "download" | None
-        self.path = ""          # file being transferred
-        self.size = 0
-        self.fraction = 0.0     # of the current transfer (big files report as they go)
-        self._started = 0.0     # when the current transfer started (for speed / time left)
+        self.active: dict[str, dict] = {}  # transfers in progress (several downloads run at once)
+        self._last = ""         # most recent transfer started (uploads report a fraction for it)
         self._shown = 0         # never let the shown percentage go backwards
         self._last_emit = 0.0
 
@@ -83,10 +80,10 @@ class Progress:
         with self.lock:  # files moved to the Recycle Bin as a whole folder etc. still count as done
             self.done = max(self.done, self._folder_start + self._folder_total)
             self.done_bytes = max(self.done_bytes, self._folder_start_bytes + self._folder_bytes)
-            self.action = None
+            self.active.clear()
         self._changed(force=True)
 
-    # -- called by the sync engines ---------------------------------------------------
+    # -- called by the sync engines (any thread) ------------------------------------------
     def add_total(self, n: int = 1, size: int = 0) -> None:
         with self.lock:
             self.total += n
@@ -100,48 +97,90 @@ class Progress:
 
     def transfer(self, action: str, path: str, size: int = 0) -> None:
         with self.lock:
-            self.action, self.path, self.size, self.fraction = action, path, size, 0.0
-            self._started = self.clock()
+            self.active[path] = {"action": action, "size": size, "got": 0, "started": self.clock()}
+            self._last = path
         self._changed(force=True)
 
     def transfer_fraction(self, fraction: float) -> None:
+        """Progress of the most recent transfer as 0..1 (how uploads report)."""
         with self.lock:
-            self.fraction = max(0.0, min(1.0, fraction))
+            t = self.active.get(self._last)
+            if t:
+                t["got"] = max(0.0, min(1.0, fraction)) * t["size"]
         self._changed()
 
-    def transfer_end(self) -> None:
+    def transfer_bytes(self, path: str, got: int) -> None:
+        """Bytes received so far for one transfer (how parallel downloads report)."""
         with self.lock:
-            self.action, self.fraction = None, 0.0
+            t = self.active.get(path)
+            if t:
+                t["got"] = got
+        self._changed()
+
+    def transfer_end(self, path: str | None = None) -> None:
+        with self.lock:
+            self.active.pop(path if path is not None else self._last, None)
 
     # -- reading ------------------------------------------------------------------------
+    def _primary(self) -> dict | None:
+        """The transfer to describe: the most recent one still running."""
+        if not self.active:
+            return None
+        key = self._last if self._last in self.active else next(reversed(self.active))
+        return {"path": key, **self.active[key]}
+
+    @property
+    def action(self) -> str | None:
+        with self.lock:
+            p = self._primary()
+        return p["action"] if p else None
+
+    @property
+    def fraction(self) -> float:
+        with self.lock:
+            p = self._primary()
+        return p["got"] / p["size"] if p and p["size"] else 0.0
+
     @property
     def percent(self) -> int:
         with self.lock:
+            moving = sum(t["got"] for t in self.active.values())
             if self.total_bytes > 0:   # by size: a file counts for how much there is to move
-                moving = self.fraction * self.size if self.action else 0
                 raw = int(100 * (self.done_bytes + moving) / self.total_bytes)
             elif self.total > 0:       # only empty files: by count
-                raw = int(100 * (self.done + (self.fraction if self.action else 0)) / self.total)
+                part = sum(t["got"] / t["size"] for t in self.active.values() if t["size"])
+                raw = int(100 * (self.done + part) / self.total)
             else:
                 return 0
             self._shown = max(self._shown, min(99, raw))  # 100 only once the sync has finished
             return self._shown
 
     def speed(self) -> float | None:
-        """Bytes per second of the current transfer (None until there's enough to tell)."""
+        """Combined bytes per second of the running transfers (None until there's enough to tell)."""
+        now = self.clock()
         with self.lock:
-            if not self.action:
-                return None
-            moved, elapsed = self.fraction * self.size, self.clock() - self._started
-        return moved / elapsed if elapsed >= 2 and moved > 0 else None
+            rates = [t["got"] / (now - t["started"]) for t in self.active.values()
+                     if now - t["started"] >= 2 and t["got"] > 0]
+        return sum(rates) if rates else None
 
     def current(self, max_len: int = 60) -> str:
-        """'Uploading Term 1/quiz.pdf (45% of 12.0 MB · 1.2 MB/s · about 2 min left)' or 'Checking files'."""
+        """'Uploading Term 1/quiz.pdf (45% of 12.0 MB · 1.2 MB/s · about 2 min left)',
+        'Downloading 4 files at once (2.1 MB/s) · quiz.pdf, plan.docx, …' or 'Checking files'."""
         with self.lock:
-            action, path, size, frac = self.action, self.path, self.size, self.fraction
-        if not action:
+            active = [{"path": k, **v} for k, v in self.active.items()]
+            primary = self._primary()
+        if not active:
             return "Checking files"
-        name = path if len(path) <= max_len else "…" + path[-(max_len - 1):]
+
+        def short(path, n=max_len):
+            return path if len(path) <= n else "…" + path[-(n - 1):]
+
+        if len(active) > 1:   # the files themselves are listed by file_lines()
+            rate = self.speed()
+            verb = VERBS.get(active[0]["action"], active[0]["action"])
+            return f"{verb} {len(active)} files at once" + (f" ({human_size(rate)}/s)" if rate else "")
+        t = primary
+        size, frac = t["size"], (t["got"] / t["size"] if t["size"] else 0.0)
         extra = ""
         if size >= 1024 * 1024:   # big files report progress while they transfer
             bits = [f"{int(frac * 100)}% of {human_size(size)}"]
@@ -155,7 +194,32 @@ class Progress:
             extra = f" ({' · '.join(bits)})"
         elif size:
             extra = f" ({human_size(size)})"
-        return f"{VERBS.get(action, action)} {name}{extra}"
+        return f"{VERBS.get(t['action'], t['action'])} {short(t['path'])}{extra}"
+
+    def file_lines(self, full_path: bool = True, max_len: int = 70) -> list[str]:
+        """One line per file being transferred right now (only when there's more than one),
+        e.g. '↓ Application/OllamaSetup.exe - 45% of 1.5 GB'. full_path=False: name only."""
+        now = self.clock()
+        with self.lock:
+            active = [{"path": k, **v} for k, v in self.active.items()]
+        if len(active) < 2:
+            return []
+        lines = []
+        for t in active:
+            name = t["path"] if full_path else t["path"].rsplit("/", 1)[-1]
+            if len(name) > max_len:
+                name = "…" + name[-(max_len - 1):]
+            arrow = "↓" if t["action"] == "download" else "↑"
+            if t["size"]:
+                pct = int(100 * t["got"] / t["size"])
+                info = f"{pct}% of {human_size(t['size'])}" if t["size"] >= 1024 * 1024 else human_size(t["size"])
+            else:
+                info = "starting"
+            elapsed = now - t["started"]
+            if t["size"] >= 1024 * 1024 and elapsed >= 2 and t["got"]:
+                info += f" · {human_size(t['got'] / elapsed)}/s"
+            lines.append(f"{arrow} {name} - {info}")
+        return lines
 
     def counter(self) -> str:
         with self.lock:

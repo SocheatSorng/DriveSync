@@ -39,9 +39,10 @@ else:
     APP_DIR = Path(__file__).resolve().parent
 # Bundled read-only files (README, icon): inside the .exe when frozen.
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-# Transfer piece size: small enough that progress moves even on a slow connection (1 MB at 14 KB/s
-# is ~70 s; 8 MB was ~10 minutes of "0%"). Uploads need a multiple of 256 KB.
-CHUNK = 1024 * 1024
+# Upload piece size (a multiple of 256 KB). Every piece is a separate request with ~0.5 s of
+# waiting, so small pieces are slow: measured 1 MB pieces at 1.1 MB/s vs 8 MB at 2.1 MB/s.
+# (Downloads don't use pieces at all - they stream; see downloader.py.)
+CHUNK = 8 * 1024 * 1024
 DOWNLOAD_PREFIX = "~drivesync-"   # in-progress downloads (two-way sync); never synced
 DEFAULT_EXCLUDES = ["desktop.ini", "Thumbs.db", ".DS_Store", "~$*", "*.tmp", "*.crdownload", "*.part",
                     f"{DOWNLOAD_PREFIX}*"]
@@ -137,16 +138,26 @@ class Drive:
         size = path.stat().st_size
         # Resumable upload for anything over 5 MB; simple upload otherwise.
         # (Empty files must use a simple upload.)
+        from downloader import LIMIT
+        # With a speed limit, smaller pieces keep uploads smooth (no 8 MB bursts at full speed).
+        chunk = CHUNK if not LIMIT.rate or LIMIT.rate >= 4 * 1024 * 1024 else 1024 * 1024
         return MediaFileUpload(str(path), mimetype=mime, resumable=size > 5 * 1024 * 1024,
-                               chunksize=CHUNK)
+                               chunksize=chunk)
 
     def _send(self, request, media) -> dict:
-        """Run an upload; big (resumable) uploads go in 1 MB pieces and report progress."""
+        """Run an upload; big (resumable) uploads go in pieces and report progress after each.
+        Every piece counts towards the speed limit (Settings)."""
+        from downloader import LIMIT
         if not media.resumable():
-            return self._exec(request)
-        response = None
+            response = self._exec(request)
+            LIMIT.consume(media.size() or 0)
+            return response
+        response, sent = None, 0
         while response is None:
             status, response = request.next_chunk(num_retries=self.retries)
+            now = status.resumable_progress if status else (media.size() or sent)
+            LIMIT.consume(max(0, now - sent))
+            sent = now
             if status and self.on_transfer:
                 self.on_transfer(status.progress())
         return response
@@ -164,22 +175,19 @@ class Drive:
         self._exec(self.s.files().update(fileId=file_id, body={"trashed": True}, fields="id", **self.ALL))
 
     # -- two-way sync -------------------------------------------------------
-    def download(self, file_id: str, dest: Path) -> None:
-        """Download to a temporary file next to dest, then swap it in (never a half-written file)."""
-        from googleapiclient.http import MediaIoBaseDownload
-        tmp = dest.with_name(f"{DOWNLOAD_PREFIX}{dest.name}.part")
-        try:
-            with open(tmp, "wb") as fh:
-                dl = MediaIoBaseDownload(fh, self.s.files().get_media(fileId=file_id, **self.ALL),
-                                         chunksize=CHUNK)
-                done = False
-                while not done:
-                    status, done = dl.next_chunk(num_retries=self.retries)
-                    if status and self.on_transfer:
-                        self.on_transfer(status.progress())
-            os.replace(tmp, dest)
-        finally:
-            tmp.unlink(missing_ok=True)
+    def download(self, file_id: str, dest: Path, *, expected_md5: str | None = None, size: int | None = None,
+                 on_bytes=None) -> None:
+        """Download a file to dest - full speed, resumable, checksum-verified, split into parts in
+        "High priority" mode, within the speed limit (see downloader.py).
+        Safe to call from several threads at once (each thread uses its own connection)."""
+        import downloader
+        downloader.download(self.creds, file_id, dest, prefix=DOWNLOAD_PREFIX, expected_md5=expected_md5,
+                            size=size, on_bytes=on_bytes)
+
+    @property
+    def creds(self):
+        """The account's credentials (google-auth), taken from the API client."""
+        return getattr(self.s._http, "credentials", None)
 
     def folder_status(self, folder_id: str) -> str:
         """'ok', 'trashed', 'missing' or 'not_folder'."""
@@ -197,16 +205,22 @@ class Drive:
     def changes_start_token(self) -> str:
         return self._exec(self.s.changes().getStartPageToken(**self.ALL))["startPageToken"]
 
-    def changes_since(self, token: str) -> tuple[bool, str]:
-        """(anything changed in this Drive?, new token) - one cheap request in the usual case."""
-        changed = False
+    def changes_since(self, token: str) -> tuple[set[str], str]:
+        """(ids of the changed files and of their folders, new token) - one cheap request usually.
+
+        The folder ids tell the two-way engine which folders to look at; it ignores ids it doesn't know."""
+        ids: set[str] = set()
         while True:
             resp = self._exec(self.s.changes().list(
-                pageToken=token, pageSize=1000, fields="nextPageToken, newStartPageToken, changes(fileId)",
+                pageToken=token, pageSize=1000,
+                fields="nextPageToken, newStartPageToken, changes(fileId, file(parents))",
                 includeItemsFromAllDrives=True, **self.ALL))
-            changed = changed or bool(resp.get("changes"))
+            for c in resp.get("changes", []):
+                if c.get("fileId"):
+                    ids.add(c["fileId"])
+                ids.update((c.get("file") or {}).get("parents") or [])
             if resp.get("newStartPageToken"):
-                return changed, resp["newStartPageToken"]
+                return ids, resp["newStartPageToken"]
             token = resp["nextPageToken"]
 
     # -- folder browser ------------------------------------------------------
@@ -437,10 +451,14 @@ def resolve_remote_root(drive: Drive, path: str, create: bool) -> str | None:
 def sync_folder(drive: Drive, local_folder: str, *, drive_folder: str | None = None,
                 drive_folder_id: str | None = None, delete: bool = False,
                 excludes: list[str] | None = None, dry_run: bool = False, on_event=None,
-                mode: str = "upload", progress=None) -> dict:
-    """Run one sync of local_folder. Returns stats (plus 'remote_id').
+                mode: str = "upload", progress=None, quick: dict | None = None) -> dict:
+    """Run one sync of local_folder. Returns stats (plus 'remote_id' and 'scope').
 
     mode: "upload" (PC -> Drive backup) or "two_way" (changes go both ways).
+    quick (two-way only): check only what changed - {"paths": changed paths on this PC,
+        "ids": changed Drive ids, "scan": also compare every file's size/time with the last sync}.
+        Falls back to checking everything when the folder has no usable sync state yet.
+    scope in the result: "quick" or "full" (what actually ran).
     """
     local_root = Path(local_folder).expanduser().resolve()
     if not local_root.is_dir():
@@ -459,12 +477,17 @@ def sync_folder(drive: Drive, local_folder: str, *, drive_folder: str | None = N
         if mode == "two_way" and not dry_run:
             from twoway import TwoWaySyncer
             # The upload-only state (if any) tells the two-way engine what was already on Drive.
-            stats = TwoWaySyncer(drive, local_root, remote_root, excludes=excludes,
-                                 state_path=state.with_suffix(".2way.json"), migrate_from=state,
-                                 on_event=on_event, progress=progress).run()
+            syncer = TwoWaySyncer(drive, local_root, remote_root, excludes=excludes,
+                                  state_path=state.with_suffix(".2way.json"), migrate_from=state,
+                                  on_event=on_event, progress=progress)
+            targets = syncer.targets_for(quick.get("paths", ()), quick.get("ids", ()),
+                                         scan=bool(quick.get("scan"))) if quick else None
+            stats = syncer.run(targets)
+            stats["scope"] = "full" if targets is None else "quick"
         else:
             stats = Syncer(drive, local_root, remote_root, excludes=excludes, delete=delete,
                            dry_run=dry_run, state_path=state, on_event=on_event, progress=progress).run()
+            stats["scope"] = "full"
     finally:
         if hasattr(drive, "on_transfer"):
             drive.on_transfer = None

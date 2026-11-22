@@ -63,14 +63,16 @@ Closing the window keeps Drive Sync running in the **system tray**. Look in the 
 
 | Icon | Meaning |
 |---|---|
-| Blue arrow | Up to date |
-| Amber | Syncing |
-| Red | Needs attention; open the window to see why |
-| Gray pause | Paused |
+| Green DS | Up to date |
+| Amber DS | Syncing |
+| Red DS | Needs attention; open the window to see why |
+| Gray DS | Paused |
 
-**Instant sync:** when you create, save, rename or delete something in a synced folder, that folder syncs a few seconds later. Drive Sync waits until the activity stops, so a file that's still being copied or saved isn't uploaded half-finished. Temporary files such as Word's `~$` lock files and `.tmp` files are ignored. As a safety net, everything is also fully checked on the **"Also check everything"** schedule, for example to catch changes made while the app was closed. You can turn instant sync off in **Settings → Syncing**.
+**Instant sync:** when you create, save, rename or delete something in a synced folder, that folder syncs a few seconds later. Drive Sync waits until the activity stops, so a file that's still being copied or saved isn't uploaded half-finished. Temporary files such as Word's `~$` lock files and `.tmp` files are ignored. As a safety net, Drive Sync also looks for missed changes on the **"Look for missed changes"** schedule. You can turn instant sync off in **Settings → Syncing**.
 
-At Windows login it starts in the tray only. It waits 30 seconds for the network, then does a full sync. If the internet is down, it retries every 2 minutes.
+**Only what changed is checked (two-way folders):** Drive Sync remembers where it stopped reading Google's list of changes, even when it's closed. At startup it asks Google what changed in the meantime, and compares every file's size and modified time on this PC with the last sync. That takes seconds even for tens of thousands of files, and nothing is read or sent. Then it syncs only the folders where something changed. Every file on both sides is still checked **once a day**, when a folder is synced for the first time, and when you press **Sync now**. Upload-only folders check every file each time.
+
+At Windows login it starts in the tray only. It waits 30 seconds for the network, then checks what changed while it was off. If the internet is down, it retries every 2 minutes.
 
 **Remove auto-start:** switch it off in Settings. If you installed from source, you can also run `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\DriveSync\uninstall.ps1"`, adding `-RemoveFiles` to also delete the app folder. Neither touches your files on Drive.
 
@@ -118,7 +120,7 @@ Run the checks locally (first install uv with `pip install uv` or from <https://
 uv sync                                   # creates .venv with exactly what uv.lock says
 uv run ruff check .
 uv run python -m unittest -v
-uv run bandit -c pyproject.toml -r drive_sync.py tray_app.py gui.py accounts.py browsers.py watcher.py activity.py activity_view.py twoway.py progress.py
+uv run bandit -c pyproject.toml -r drive_sync.py tray_app.py gui.py accounts.py browsers.py watcher.py activity.py activity_view.py twoway.py progress.py downloader.py
 uv run pip-audit -r requirements.txt --require-hashes --disable-pip
 uv run zizmor .github/workflows
 uv run pre-commit install                 # once per clone (needs a git repository)

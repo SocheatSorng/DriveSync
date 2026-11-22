@@ -73,6 +73,21 @@ class ChangeTrackerTests(unittest.TestCase):
         clock.t = 107
         self.assertEqual(tr.take_settled(), {"B"})
 
+    def test_remembers_changed_paths_per_folder(self):
+        tr = ChangeTracker(settle=4, clock=FakeClock())
+        tr.mark("A", paths=["A/x.txt"])
+        tr.mark("A", paths=["A/y.txt"])
+        tr.mark("B")
+        self.assertEqual(tr.take_paths("A"), {"A/x.txt", "A/y.txt"})
+        self.assertEqual(tr.take_paths("A"), set())      # handed out once
+        self.assertEqual(tr.take_paths("B"), set())
+
+    def test_too_many_paths_means_check_everything(self):
+        tr = ChangeTracker(settle=4, clock=FakeClock())
+        tr.mark("A", paths=[f"f{i}" for i in range(ChangeTracker.MAX_PATHS + 1)])
+        tr.mark("A", paths=["one more"])
+        self.assertIsNone(tr.take_paths("A"))
+
 
 class LiveWatchTests(unittest.TestCase):
     """Uses the real Windows change notifications on a temporary folder."""
@@ -86,8 +101,8 @@ class LiveWatchTests(unittest.TestCase):
         self.events: list = []
         self.got = threading.Event()
 
-        def on_change(key):
-            self.events.append(key)
+        def on_change(key, paths):
+            self.events.append((key, paths))
             self.got.set()
 
         self.w = FolderWatcher(on_change, ignore_under=(str(self.app_dir),))
@@ -115,8 +130,17 @@ class LiveWatchTests(unittest.TestCase):
         (self.root / "sub").mkdir()
         time.sleep(0.3)
         self.expect(lambda: (self.root / "sub" / "a.txt").write_text("x"), True)  # inside a subfolder
+        self.assertIn(str(self.root / "sub" / "a.txt"), {p for _, paths in self.events for p in paths})
         self.expect(lambda: (self.root / "lesson-final.docx").unlink(), True)     # deleted
-        self.assertEqual(set(self.events) | {"K"}, {"K"})
+        self.assertEqual({k for k, _ in self.events}, {"K"})
+        self.assertIn(str(self.root / "lesson-final.docx"), {p for _, paths in self.events for p in paths})
+
+    def test_rename_reports_old_and_new_path(self):
+        f = self.root / "draft.txt"
+        self.expect(lambda: f.write_text("x"), True)
+        self.expect(lambda: f.rename(self.root / "final.txt"), True)
+        got = {p for _, paths in self.events for p in paths}
+        self.assertTrue({str(self.root / "draft.txt"), str(self.root / "final.txt")} <= got, got)
 
     def test_ignores_excluded_and_own_files(self):
         self.expect(lambda: (self.root / "~$lesson.docx").write_text("lock"), False)

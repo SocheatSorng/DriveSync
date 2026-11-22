@@ -22,6 +22,8 @@ SECONDARY = {"fg_color": "transparent", "border_width": 1, "text_color": ("#1f1f
 DANGER = {"fg_color": "transparent", "text_color": ("#d93025", "#f28b82"),
           "hover_color": ("#fce8e6", "#3c2a2a")}
 MODES = {"Two-way": "two_way", "Upload only (backup)": "upload"}
+LIMITS = {"No limit": 0, "256 KB/s": 256, "512 KB/s": 512, "1 MB/s": 1024, "2 MB/s": 2048,
+          "5 MB/s": 5120, "10 MB/s": 10240}
 POLLS = {"Every 5 seconds": 5, "Every 10 seconds": 10, "Every 30 seconds": 30, "Every minute": 60}
 INTERVALS = {"Every 5 minutes": 5, "Every 15 minutes": 15, "Every 30 minutes": 30, "Every hour": 60,
              "Every 3 hours": 180, "Every 6 hours": 360, "Once a day": 1440}
@@ -582,18 +584,50 @@ class MainWindow:
             anchor="w", padx=16, pady=(0, 10))
         r = ctk.CTkFrame(sync, fg_color="transparent")
         r.pack(anchor="w", padx=16, pady=(2, 0))
-        ctk.CTkLabel(r, text="Also check everything", font=font()).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(r, text="Look for missed changes", font=font()).pack(side="left", padx=(0, 10))
         current = next((k for k, v in INTERVALS.items() if v == cfg.get("interval_minutes")), None)
         values = list(INTERVALS) if current else [f"Every {cfg.get('interval_minutes')} minutes", *INTERVALS]
         self.interval_menu = ctk.CTkOptionMenu(r, values=values, width=170, command=lambda _: self.save_options())
         self.interval_menu.set(current or values[0])
         self.interval_menu.pack(side="left")
+        ctk.CTkLabel(sync, text="Two-way folders compare file sizes and times on this PC (a few seconds, no "
+                                "internet) and check every file on both sides once a day. Sync now checks "
+                                "every file right away.", font=font(12), text_color=MUTED, anchor="w",
+                     justify="left", wraplength=560).pack(anchor="w", padx=16, pady=(4, 0))
         self.notify_var = tk.BooleanVar(value=bool(cfg.get("notify_on_changes")))
         ctk.CTkSwitch(sync, text="Show a notification when files are uploaded", variable=self.notify_var,
                       command=self.save_options, font=font()).pack(anchor="w", padx=16, pady=(12, 0))
         self.startup_var = tk.BooleanVar(value=self.app.startup_enabled())
         ctk.CTkSwitch(sync, text="Start Drive Sync when I sign in to Windows", variable=self.startup_var,
                       command=self.toggle_startup, font=font()).pack(anchor="w", padx=16, pady=(10, 14))
+
+        net = card("Internet use")
+        r = ctk.CTkFrame(net, fg_color="transparent")
+        r.pack(anchor="w", padx=16, pady=(2, 0))
+        ctk.CTkLabel(r, text="Priority", font=font()).pack(side="left", padx=(0, 10))
+        self.priority_btn = ctk.CTkSegmentedButton(r, values=["Normal", "High"], command=lambda _: self.save_options())
+        self.priority_btn.set("High" if cfg.get("high_priority") else "Normal")
+        self.priority_btn.pack(side="left")
+        prio_help = ctk.CTkLabel(net, text="High: big downloads (16 MB+) use 4 connections at once, so Drive Sync gets "
+                                           "more of your internet while other apps are using it. It can't make the "
+                                           "line itself faster, and it doesn't take priority over other devices on "
+                                           "your network (your router decides that).",
+                                 font=font(12), text_color=MUTED, anchor="w", justify="left")
+        prio_help.pack(anchor="w", padx=16, pady=(4, 10), fill="x")
+        autowrap(prio_help, net, margin=40)
+        r = ctk.CTkFrame(net, fg_color="transparent")
+        r.pack(anchor="w", padx=16, pady=(2, 0))
+        ctk.CTkLabel(r, text="Speed limit", font=font()).pack(side="left", padx=(0, 10))
+        limit_now = next((k for k, v in LIMITS.items() if v == cfg.get("speed_limit_kbps", 0)),
+                         f"{cfg.get('speed_limit_kbps')} KB/s")
+        self.limit_menu = ctk.CTkOptionMenu(r, values=list(LIMITS), width=170, command=lambda _: self.save_options())
+        self.limit_menu.set(limit_now)
+        self.limit_menu.pack(side="left")
+        limit_help = ctk.CTkLabel(net, text="Caps Drive Sync's total upload + download speed, to keep the rest of "
+                                            "your internet free (e.g. for video calls). Applies immediately.",
+                                  font=font(12), text_color=MUTED, anchor="w", justify="left")
+        limit_help.pack(anchor="w", padx=16, pady=(4, 14), fill="x")
+        autowrap(limit_help, net, margin=40)
 
         look = card("Appearance")
         self.theme_btn = ctk.CTkSegmentedButton(look, values=["System", "Light", "Dark"],
@@ -617,7 +651,8 @@ class MainWindow:
         color = STATE_COLORS["paused" if app.paused and app.state != "syncing" else app.state]
         self.dot.configure(text_color=color)
         self.status_lbl.configure(text=app.status)
-        self.detail_lbl.configure(text=app.detail)
+        files = app.file_lines if app.state == "syncing" else []
+        self.detail_lbl.configure(text="\n".join([app.detail, *files]))  # one line per file at once
         self.pause_btn.configure(text="Resume" if app.paused else "Pause")
         self.sync_btn.configure(state="disabled" if app.state == "syncing" else "normal")
         prog = app.progress
@@ -826,7 +861,9 @@ class MainWindow:
         minutes = INTERVALS.get(choice, self.app.cfg.get("interval_minutes", 15))
         cfg = dict(self.app.cfg, interval_minutes=minutes, notify_on_changes=self.notify_var.get(),
                    watch_changes=self.watch_var.get(),
-                   drive_poll_seconds=POLLS.get(self.poll_menu.get(), 10))
+                   drive_poll_seconds=POLLS.get(self.poll_menu.get(), 10),
+                   high_priority=self.priority_btn.get() == "High",
+                   speed_limit_kbps=LIMITS.get(self.limit_menu.get(), self.app.cfg.get("speed_limit_kbps", 0)))
         if cfg != self.app.cfg:
             self.app.save_config(cfg)
 

@@ -64,6 +64,28 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(p.current(), "Downloading Brave Browser/User Data.zip "
                                       "(0% of 120.0 MB · 14.6 KB/s · about 2.3 h left)")
 
+    def test_each_file_gets_its_own_line_when_several_download_at_once(self):
+        t = [0.0]
+        mb = 1024 * 1024
+        p = Progress(clock=lambda: t[0])
+        p.transfer("download", "Application/OllamaSetup.exe", 1500 * mb)
+        self.assertEqual(p.file_lines(), [])                  # one file: the main line already names it
+        p.transfer("download", "Application/td-setup-win-x64-7.2.9.exe", 80 * mb)
+        p.transfer("download", "Docs/notes.txt", 2048)
+        t[0] = 10.0
+        p.transfer_bytes("Application/OllamaSetup.exe", 675 * mb)
+        p.transfer_bytes("Application/td-setup-win-x64-7.2.9.exe", 20 * mb)
+        self.assertEqual(p.current(), "Downloading 3 files at once (69.5 MB/s)")
+        self.assertEqual(p.file_lines(), [
+            "↓ Application/OllamaSetup.exe - 45% of 1.5 GB · 67.5 MB/s",
+            "↓ Application/td-setup-win-x64-7.2.9.exe - 25% of 80.0 MB · 2.0 MB/s",
+            "↓ Docs/notes.txt - 2.0 KB",
+        ])
+        self.assertEqual(p.file_lines(full_path=False)[0], "↓ OllamaSetup.exe - 45% of 1.5 GB · 67.5 MB/s")
+        p.transfer_end("Docs/notes.txt")
+        p.transfer_end("Application/td-setup-win-x64-7.2.9.exe")
+        self.assertEqual(p.file_lines(), [])                  # back to one file
+
     def test_small_files_show_size_without_percent(self):
         p = Progress()
         p.transfer("download", "notes.txt", 2048)

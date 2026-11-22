@@ -17,7 +17,7 @@ repos:
       - id: bandit
         args: ["-c", "pyproject.toml"]
         additional_dependencies: ["bandit[toml]"]
-        files: ^(drive_sync|tray_app|gui|accounts|browsers|watcher|activity|activity_view|twoway|progress)\.py$
+        files: ^(drive_sync|tray_app|gui|accounts|browsers|watcher|activity|activity_view|twoway|progress|downloader|logo)\.py$
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
     rev: v1.32.0
     hooks:

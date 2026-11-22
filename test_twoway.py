@@ -10,7 +10,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import twoway
 from drive_sync import DEFAULT_EXCLUDES, FOLDER_MIME
 from twoway import DriveFolderGone, TwoWaySyncer
 
@@ -21,10 +23,22 @@ class FakeDrive:
     def __init__(self):
         self.items = {"root": {"id": "root", "name": "", "mimeType": FOLDER_MIME, "parent": None}}
         self.ids = itertools.count(1)
+        self.changes: set[str] = set()   # like Google's change list: changed ids and their folders
+        self.listed: list[str] = []      # folders whose contents were asked for
+
+    def _touch(self, i):
+        self.changes.add(i)
+        if self.items[i].get("parent"):
+            self.changes.add(self.items[i]["parent"])
+
+    def take_changes(self):
+        got, self.changes = self.changes, set()
+        return got
 
     def _new(self, **kw):
         i = f"id{next(self.ids)}"
         self.items[i] = {"id": i, **kw}
+        self._touch(i)
         return i
 
     def _alive(self, item):
@@ -35,6 +49,7 @@ class FakeDrive:
         return True
 
     def list_children(self, fid):
+        self.listed.append(fid)
         return [{k: v for k, v in i.items() if k != "content"} for i in self.items.values()
                 if i.get("parent") == fid and self._alive(i)]
 
@@ -53,12 +68,14 @@ class FakeDrive:
     def update(self, fid, path):
         data = Path(path).read_bytes()
         self.items[fid].update(content=data, md5Checksum=hashlib.md5(data).hexdigest())
+        self._touch(fid)
 
-    def download(self, fid, dest):
+    def download(self, fid, dest, **kw):
         Path(dest).write_bytes(self.items[fid]["content"])
 
     def trash(self, fid):
         self.items[fid]["trashed"] = True
+        self._touch(fid)
 
     # helpers for tests (act like a person using drive.google.com)
     def find(self, path):
@@ -70,7 +87,9 @@ class FakeDrive:
 
     def web_edit(self, path, text):
         data = text.encode()
-        self.items[self.find(path)].update(content=data, md5Checksum=hashlib.md5(data).hexdigest())
+        i = self.find(path)
+        self.items[i].update(content=data, md5Checksum=hashlib.md5(data).hexdigest())
+        self._touch(i)
 
     def web_add(self, parent_path, name, text):
         parent = self.find(parent_path) if parent_path else "root"
@@ -258,6 +277,23 @@ class TwoWayTests(unittest.TestCase):
         self.assertIn("Unit 1/Lesson notes", self.drive.tree())  # ...but the Google Doc isn't trashed
         self.assertIn(("trashed", "Unit 1/plan.docx"), ev)
 
+    def test_progress_is_saved_during_a_long_sync(self):
+        # If the app is closed or crashes half-way, the next start must not start from nothing.
+        for n in "abc":
+            self.write(f"{n}.txt", n)
+        saved_while_running = []
+        real_upload = self.drive.upload
+
+        def upload(path, parent):
+            if self.state.exists():
+                saved_while_running.append(set(json.loads(self.state.read_text())["base"]))
+            return real_upload(path, parent)
+
+        self.drive.upload = upload
+        with mock.patch.object(twoway, "SAVE_EVERY", 0):
+            self.sync()
+        self.assertEqual(saved_while_running, [{"a.txt"}, {"a.txt", "b.txt"}])
+
     def test_temp_download_names_are_never_synced(self):
         self.start()
         self.write("~drivesync-x.part", "partial")
@@ -288,6 +324,102 @@ class TwoWayTests(unittest.TestCase):
         self.assertIn(("deleted_local", "Testing"), ev)    # follows the Drive deletion
         self.assertIn(("uploaded", "Later/new.txt"), ev)   # new since then: uploaded, not deleted
         self.assertFalse((self.pc / "Testing").exists())
+
+
+class QuickSyncTests(TwoWayTests):
+    """Every scenario above again, but each sync after the first looks only at what changed:
+    Drive's change list plus the quick size/time comparison on the PC (what happens at startup)."""
+
+    def sync(self, migrate_from=None):
+        self.events = []
+        s = TwoWaySyncer(self.drive, self.pc, "root", excludes=DEFAULT_EXCLUDES, state_path=self.state,
+                         migrate_from=migrate_from, recycle=self.recycle,
+                         on_event=lambda k, p, m: self.events.append((k, p)))
+        s.run(s.targets_for(drive_ids=self.drive.take_changes(), scan=True))
+        return sorted(self.events)
+
+    def quick(self, paths=(), scan=False):
+        self.events, self.drive.listed = [], []
+        s = TwoWaySyncer(self.drive, self.pc, "root", excludes=DEFAULT_EXCLUDES, state_path=self.state,
+                         recycle=self.recycle, on_event=lambda k, p, m: self.events.append((k, p)))
+        targets = s.targets_for(paths=[str(self.pc / p) for p in paths],
+                                drive_ids=self.drive.take_changes(), scan=scan)
+        s.run(targets)
+        return targets, sorted(self.events)
+
+    def big_tree(self):
+        for u in range(1, 6):
+            for f in range(3):
+                self.write(f"Unit {u}/Week {f}/file{f}.txt", "x")
+        self.sync()
+        self.drive.take_changes()          # Drive Sync's own uploads (seen at the next poll)
+
+    def test_nothing_changed_checks_no_folders(self):
+        self.big_tree()
+        targets, ev = self.quick(scan=True)
+        self.assertEqual((targets, ev, self.drive.listed), (set(), [], []))
+
+    def test_pc_change_checks_only_its_folder(self):
+        self.big_tree()
+        self.write("Unit 3/Week 1/file1.txt", "edited")
+        targets, ev = self.quick(scan=True)
+        self.assertEqual(targets, {"Unit 3/Week 1"})
+        self.assertEqual(ev, [("updated", "Unit 3/Week 1/file1.txt")])
+        self.assertEqual(self.drive.listed, [self.drive.find("Unit 3/Week 1")])
+
+    def test_drive_change_checks_only_its_folder(self):
+        self.big_tree()
+        self.drive.web_edit("Unit 2/Week 0/file0.txt", "from web")
+        targets, ev = self.quick()
+        # Google lists the file's folder as changed too; a changed folder's own folder is checked as
+        # well (it may have been renamed or moved) - one extra listing, still nothing else.
+        self.assertEqual(targets, {"Unit 2/Week 0", "Unit 2"})
+        self.assertEqual(ev, [("downloaded", "Unit 2/Week 0/file0.txt")])
+        self.assertEqual((self.pc / "Unit 2/Week 0/file0.txt").read_text(), "from web")
+
+    def test_watched_paths_without_scanning(self):
+        self.big_tree()
+        self.write("Unit 5/Week 2/new.txt", "n")
+        targets, ev = self.quick(paths=["Unit 5/Week 2/new.txt"])
+        self.assertEqual((targets, ev), ({"Unit 5/Week 2"}, [("uploaded", "Unit 5/Week 2/new.txt")]))
+
+    def test_new_folder_on_pc_is_uploaded_whole(self):
+        self.big_tree()
+        self.write("Unit 9/a/b.txt", "deep")
+        targets, ev = self.quick(paths=["Unit 9/a/b.txt"])  # its folders aren't known yet: the
+        self.assertEqual(targets, {""})                     # nearest known one is checked
+        self.assertEqual(ev, [("folder", "Unit 9"), ("folder", "Unit 9/a"), ("uploaded", "Unit 9/a/b.txt")])
+
+    def test_folder_deleted_on_pc_found_by_scan(self):
+        self.big_tree()
+        shutil.rmtree(self.pc / "Unit 4")
+        targets, ev = self.quick(scan=True)
+        self.assertEqual(targets, {""})
+        self.assertIn(("trashed", "Unit 4"), ev)
+
+    def test_folder_moved_on_drive(self):
+        self.big_tree()
+        item = self.drive.items[self.drive.find("Unit 1/Week 0")]
+        item["parent"] = self.drive.find("Unit 2")           # moved from Unit 1 to Unit 2 on the web
+        self.drive.changes |= {item["id"], self.drive.find("Unit 2")}
+        targets, ev = self.quick()
+        self.assertEqual(targets, {"", "Unit 1", "Unit 2", "Unit 1/Week 0"})
+        self.assertFalse((self.pc / "Unit 1/Week 0").exists())
+        self.assertEqual((self.pc / "Unit 2/Week 0/file0.txt").read_text(), "x")
+        self.assertEqual(local_tree(self.pc), self.drive.tree())
+
+    def test_changes_outside_the_synced_folder_are_ignored(self):
+        self.big_tree()
+        self.drive.changes |= {"some-other-file", "some-other-folder"}
+        targets, ev = self.quick()
+        self.assertEqual((targets, ev, self.drive.listed), (set(), [], []))
+
+    def test_upload_only_state_needs_a_full_check(self):
+        self.write("a.txt", "a")
+        self.state.write_text(json.dumps({"version": 2, "root": "root",
+                                          "base": {"Old": {"t": "d"}}}))   # no Drive id yet
+        s = TwoWaySyncer(self.drive, self.pc, "root", excludes=DEFAULT_EXCLUDES, state_path=self.state)
+        self.assertIsNone(s.targets_for(scan=True))
 
 
 if __name__ == "__main__":

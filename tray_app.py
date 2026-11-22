@@ -24,11 +24,14 @@ from pathlib import Path
 
 import customtkinter as ctk
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image
 
 import accounts
 import activity
 import browsers
+import logo
+from downloader import PARALLEL
+from downloader import apply_settings as apply_network_settings
 from drive_sync import APP_DIR, DEFAULT_EXCLUDES, RESOURCE_DIR, Drive, build_service, sync_folder
 from progress import Progress, count_files
 from watcher import ChangeTracker, FolderWatcher
@@ -45,12 +48,17 @@ NOTEPAD = WINDIR / "notepad.exe"
 POWERSHELL = WINDIR / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
 DRIVE_SETTLE_SECONDS = 1.0  # Drive-side changes: short wait (a few files often change together)
+SYNC_STATE_PATH = APP_DIR / "sync_state.json"  # where Drive's change list was read up to, etc.
+FULL_CHECK_HOURS = 24       # two-way folders: check every file on both sides this often (safety net)
+MAX_PENDING_IDS = 20_000    # more Drive changes than this waiting: just check everything
 
 DEFAULT_CONFIG = {
     "interval_minutes": 15,
     "startup_delay_seconds": 30,
     "watch_changes": True,   # sync a folder seconds after something in it changes
     "drive_poll_seconds": 10,  # two-way: how often to ask Google "anything new?" (one small request)
+    "high_priority": False,    # big downloads use 4 connections -> bigger share when other apps are busy
+    "speed_limit_kbps": 0,     # cap on Drive Sync's combined speed in KB/s (0 = no limit)
     "notify_on_changes": False,
     "appearance": "System",
     "folders": [],
@@ -59,24 +67,24 @@ log = logging.getLogger("drive_sync")
 
 
 # --------------------------------------------------------------------------- #
-def make_icon(color: str, paused: bool = False) -> Image.Image:
-    """Round badge with an upload arrow (or pause bars)."""
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.ellipse((2, 2, 62, 62), fill=color)
-    if paused:
-        d.rectangle((21, 18, 28, 46), fill="white")
-        d.rectangle((36, 18, 43, 46), fill="white")
-    else:
-        d.polygon([(32, 12), (49, 31), (39, 31), (39, 50), (25, 50), (25, 31), (15, 31)], fill="white")
-    return img
+def tray_icon_size() -> int:
+    """The tray's icon size in pixels (16 at 100% display scaling), so the logo is drawn for it exactly."""
+    try:
+        return max(16, int(ctypes.windll.user32.GetSystemMetrics(49)))  # SM_CXSMICON
+    except Exception:  # noqa: BLE001
+        return 16
+
+
+def make_icon(color: str) -> Image.Image:
+    """The DS logo; the letters' color shows the state."""
+    return logo.draw(tray_icon_size(), color)
 
 
 ICONS = {
-    "idle": make_icon("#1a73e8"),     # blue   - up to date
-    "syncing": make_icon("#f9ab00"),  # amber  - working
-    "error": make_icon("#d93025"),    # red    - needs attention
-    "paused": make_icon("#80868b", paused=True),
+    "idle": make_icon(logo.GREEN),    # green  - up to date
+    "syncing": make_icon("#ffb020"),  # amber  - working
+    "error": make_icon("#ff4d4f"),    # red    - needs attention
+    "paused": make_icon("#8b949e"),   # grey   - paused
 }
 
 
@@ -102,7 +110,14 @@ class App:
         self.activity = activity.ActivityStore(APP_DIR / "activity.jsonl")
         self.last_check: dict | None = None         # most recent sync, even if nothing changed
         self.progress: Progress | None = None       # set while a sync runs
-        self.change_tokens: dict[str, str] = {}     # account -> Drive change-feed position
+        self.file_lines: list[str] = []             # files transferring at once (window: with folders)
+        self.menu_file_lines: list[str] = []        # the same, names only (tray menu)
+        # Saved across restarts, so a restart only looks at what changed while the app was off:
+        #   tokens:    account -> position in Drive's change list
+        #   pending:   folder -> Drive ids changed since its last sync
+        #   last_full: folder -> when every file was last checked
+        self.sync_state = self._load_sync_state()
+        self.change_tokens: dict[str, str] = self.sync_state["tokens"]
         self.drive_marked: set = set()              # folders queued because Drive changed
         self._last_event_key = None
         self.changes = ChangeTracker()              # folders changed on disk, waiting to settle
@@ -112,6 +127,7 @@ class App:
         self.readme_path = RESOURCE_DIR / "README.md"
         self.start_hidden = start_hidden
         self.cfg = self.load_config()
+        self.apply_network(self.cfg)
 
         ctk.set_appearance_mode(self.cfg.get("appearance", "System").lower())
         ctk.set_default_color_theme("blue")
@@ -125,6 +141,9 @@ class App:
             pystray.MenuItem(lambda _: self.status, None, enabled=False),
             pystray.MenuItem(lambda _: self.menu_detail(), None, enabled=False,
                              visible=lambda _: bool(self.menu_detail())),
+            # One line per file while several transfer at once (up to the number of parallel downloads).
+            *[pystray.MenuItem(lambda _, i=i: self.menu_file(i), None, enabled=False,
+                               visible=lambda _, i=i: bool(self.menu_file(i))) for i in range(PARALLEL)],
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open Drive Sync", lambda *_: self.ui.put(("show",)), default=True),
             pystray.MenuItem("Sync now", lambda *_: self.sync_now()),
@@ -153,6 +172,16 @@ class App:
         tmp.replace(CONFIG_PATH)
         log.info("Settings saved")
         self.refresh_watchers()  # folders / exclusions / instant-sync switch may have changed
+        self.apply_network(cfg)
+
+    @staticmethod
+    def apply_network(cfg: dict) -> None:
+        """Internet priority and speed limit - take effect immediately, even mid-transfer."""
+        try:
+            limit = max(0, int(cfg.get("speed_limit_kbps") or 0)) * 1024
+        except (TypeError, ValueError):
+            limit = 0
+        apply_network_settings(bool(cfg.get("high_priority")), limit)
 
     # ----------------------------------------------------------------- state
     def set_state(self, state: str, status: str, detail: str = "") -> None:
@@ -184,13 +213,16 @@ class App:
 
     # ---------------------------------------------------------------- worker
     def worker(self) -> None:
-        """Full sync at start and on the timer (safety net); changed folders sync within seconds."""
+        """A check at start and on the timer (safety net); changed folders sync within seconds.
+
+        Two-way folders only look at what changed: Drive's change list (saved across restarts) plus a
+        quick size/time comparison on this PC. Every file is checked once a day and on "Sync now"."""
         delay = self.cfg.get("startup_delay_seconds", 30) if self.start_hidden else 1
         self.set_state("idle", "Starting…", "Waiting for the network" if self.start_hidden else "")
         self.wake.wait(delay)
         self.wake.clear()
-        next_full = time.monotonic()  # sync everything right away
-        next_poll = time.monotonic()  # first poll only records where Drive's change feed starts
+        next_full = time.monotonic()  # check right away
+        next_poll = time.monotonic()  # first poll: what changed on Drive while the app was off
         first = True
         while not self.stopping.is_set():
             if not self.paused and time.monotonic() >= next_poll:
@@ -198,10 +230,10 @@ class App:
                 next_poll = time.monotonic() + self._poll_interval()
             if not self.paused:
                 if self.force_full or time.monotonic() >= next_full:
-                    trigger = "manual" if self.force_full else "startup" if first else "scheduled"
+                    manual = self.force_full
+                    trigger = "manual" if manual else "startup" if first else "scheduled"
                     self.force_full, first = False, False
-                    self.changes.clear()  # a full sync covers everything changed so far
-                    ok = self.sync_all(trigger=trigger)
+                    ok = self.sync_all(trigger=trigger, full=manual, scan=True)
                     next_full = time.monotonic() + (self._interval() if ok else min(self._interval(), 120))
                 else:
                     changed = self.changes.take_settled()
@@ -218,7 +250,8 @@ class App:
             self.wake.clear()
 
     def _poll_drive(self) -> None:
-        """Ask Google (cheaply) whether anything changed in each two-way account since last time."""
+        """Ask Google (cheaply) what changed in each two-way account since last time. The changed
+        ids are saved per folder, so changes made while the app was off are found at the next start."""
         cfg = self.load_config()
         known = accounts.list_accounts()
         by_account: dict[str, list] = {}
@@ -233,17 +266,80 @@ class App:
                 if drive is None:
                     continue
                 token = self.change_tokens.get(email)
+                ids: set[str] = set()
+                if token is not None:
+                    try:
+                        ids, new_token = drive.changes_since(token)
+                    except Exception as e:  # noqa: BLE001
+                        if not self._is_bad_token(e):
+                            raise
+                        log.info("Google's change list for %s restarted - checking everything once", email)
+                        token = None
                 if token is None:
-                    self.change_tokens[email] = drive.changes_start_token()
-                    continue
-                changed, self.change_tokens[email] = drive.changes_since(token)
-                if changed:
+                    # Starting the change list now: whatever happened before is unknown, so these
+                    # folders get one full check (which also covers anything from before this point).
+                    new_token = drive.changes_start_token()
+                    for key in keys:
+                        self.sync_state["last_full"].pop(self._state_key(key), None)
+                for key in keys:
+                    if ids:
+                        k = self._state_key(key)
+                        pending = set(self.sync_state["pending"].get(k, ())) | ids
+                        if len(pending) > MAX_PENDING_IDS:
+                            pending = set()
+                            self.sync_state["last_full"].pop(k, None)   # too much changed: check it all
+                        self.sync_state["pending"][k] = sorted(pending)
+                self.change_tokens[email] = new_token
+                self._save_sync_state()     # token and pending ids together, so nothing is lost
+                if ids:
                     log.info("Changes on Google Drive (%s) - checking two-way folders", email)
                     for key in keys:
                         self.drive_marked.add(key)
                         self.changes.mark(key, settle=DRIVE_SETTLE_SECONDS)
             except Exception as e:  # noqa: BLE001 - offline etc.; the timer still covers it
                 log.debug("Couldn't check Drive for changes (%s): %s", email, e)
+
+    @staticmethod
+    def _is_bad_token(e: Exception) -> bool:
+        status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+        return status in (400, 404, 410)
+
+    # Saved sync state ------------------------------------------------------------
+    @staticmethod
+    def _state_key(key) -> str:
+        return f"{key[0]}|{key[1]}"
+
+    def _load_sync_state(self) -> dict:
+        state = {"tokens": {}, "pending": {}, "last_full": {}}
+        try:
+            data = json.loads(SYNC_STATE_PATH.read_text(encoding="utf-8"))
+            for k in state:
+                if isinstance(data.get(k), dict):
+                    state[k] = data[k]
+        except (OSError, ValueError):
+            pass
+        return state
+
+    def _save_sync_state(self) -> None:
+        try:
+            SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SYNC_STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.sync_state), encoding="utf-8")
+            tmp.replace(SYNC_STATE_PATH)
+        except OSError as e:
+            log.warning("Couldn't save sync state: %s", e)
+
+    def _quick_plan(self, f: dict, key, email: str | None, full: bool, scan: bool) -> dict | None:
+        """What a quick sync of this folder should look at, or None to check every file."""
+        k = self._state_key(key)
+        last_full = self.sync_state["last_full"].get(k)
+        if (full or f.get("mode", "two_way") != "two_way" or not last_full or email not in self.change_tokens
+                or time.time() - last_full > FULL_CHECK_HOURS * 3600):
+            return None
+        paths = self.changes.take_paths(key)
+        if paths is None:              # too many changes on this PC to list
+            return None
+        return {"paths": paths, "ids": set(self.sync_state["pending"].get(k, ())), "scan": scan}
 
     def _poll_interval(self) -> float:
         try:
@@ -262,8 +358,8 @@ class App:
     def folder_key(folder: dict, known: list[str]) -> tuple[str, str | None]:
         return os.path.normcase(os.path.normpath(folder["local"])), App.folder_account(folder, known)
 
-    def _on_folder_changed(self, key) -> None:  # called from the watcher thread
-        self.changes.mark(key)
+    def _on_folder_changed(self, key, paths) -> None:  # called from the watcher thread
+        self.changes.mark(key, paths=paths)
         self.wake.set()
 
     def refresh_watchers(self) -> None:
@@ -342,12 +438,20 @@ class App:
     def _on_progress(self, p: Progress) -> None:
         """Called (throttled) from the sync thread: update the tray menu, tooltip and window."""
         folder = Path(p.folder).name if p.folder else ""
+        # Snapshot the per-file lines first: set_state() redraws the menu and window from them.
+        self.file_lines = p.file_lines(full_path=True)
+        self.menu_file_lines = p.file_lines(full_path=False, max_len=45)
         self.set_state("syncing", f"Syncing… {p.percent}%",
                        f"{p.current()} · {p.counter()}" + (f" · {folder}" if folder else ""))
 
     def menu_detail(self) -> str:
         text = self.detail if self.state == "syncing" else ""
         return text if len(text) <= 70 else text[:69] + "…"
+
+    def menu_file(self, i: int) -> str:
+        """Tray menu line for the i-th file transferring right now ('' hides the line)."""
+        lines = self.menu_file_lines if self.state == "syncing" else []
+        return f"    {lines[i]}" if i < len(lines) else ""
 
     # -------------------------------------------------------------- activity
     def _record(self, entry: dict) -> None:
@@ -371,8 +475,12 @@ class App:
         return isinstance(e, RefreshError) or "invalid_grant" in str(e) or "401" in str(e)
 
     # ------------------------------------------------------------------ sync
-    def sync_all(self, only: set | None = None, trigger: str = "scheduled") -> bool:
-        """Sync every folder, or only the folders whose keys are in `only` (changed folders)."""
+    def sync_all(self, only: set | None = None, trigger: str = "scheduled", full: bool = False,
+                 scan: bool = False) -> bool:
+        """Sync every folder, or only the folders whose keys are in `only` (changed folders).
+
+        Two-way folders look only at what changed (see _quick_plan) unless `full`, or their daily
+        full check is due. scan: also compare every file's size/time on this PC with the last sync."""
         self.set_state("syncing", "Syncing changes…" if only else "Syncing…")
         if not CREDS_PATH.exists():
             self.set_state("error", "Set up Google access", "Settings → Import credentials.json")
@@ -392,21 +500,40 @@ class App:
             folders = [f for f in folders if self.folder_key(f, known) in only]
 
         totals = dict(uploaded=0, updated=0, trashed=0, downloaded=0, deleted_local=0, conflicts=0, errors=0)
-        # Count files first so the UI can show a percentage and "file X of Y".
+        # Decide per folder: only what changed, or every file.
+        plans = []
+        for f in folders:
+            key = self.folder_key(f, known)
+            email = self.folder_account(f, known)
+            plan = self._quick_plan(f, key, email, full, scan)
+            if plan is None:
+                self.changes.take_paths(key)   # checking everything covers these
+            elif not (plan["paths"] or plan["ids"] or plan["scan"]):
+                continue                       # nothing changed for this folder
+            plans.append((f, key, email, plan))
+        if not plans:
+            self.set_state("idle", "Up to date", self.detail)
+            return True
+        # Count files first so the UI can show a percentage and "file X of Y". A quick sync counts
+        # the files of each folder it looks at as it goes.
         prog = Progress(on_change=self._on_progress)
         counts = []
-        for f in folders:
+        for f, _key, _email, plan in plans:
             try:
-                counts.append(count_files(f["local"], list(DEFAULT_EXCLUDES) + list(f.get("exclude", []))))
+                counts.append((0, 0) if plan else
+                              count_files(f["local"], list(DEFAULT_EXCLUDES) + list(f.get("exclude", []))))
             except OSError:
                 counts.append((0, 0))
         prog.add_total(sum(n for n, _ in counts), sum(b for _, b in counts))
         self.progress = prog
-        for f, (n_files, n_bytes) in zip(folders, counts, strict=True):
+        for (f, key, email, plan), (n_files, n_bytes) in zip(plans, counts, strict=True):
             if self.stopping.is_set() or self.paused:
+                if plan:
+                    self.changes.mark(key, paths=plan["paths"])   # not done: keep for next time
                 break
-            email = self.folder_account(f, known)
-            self.set_state("syncing", "Syncing changes…" if only else "Syncing…", f"{f['local']}  →  {email}")
+            started_at = time.time()
+            self.set_state("syncing", "Checking changes…" if plan else "Checking all files…",
+                           f"{f['local']}  →  {email}")
             run = activity.new_run(f["local"], email, trigger, f.get("drive_folder", ""))
             started = time.monotonic()
             prog.begin_folder(f["local"], n_files, n_bytes)
@@ -416,22 +543,27 @@ class App:
                 why = ("needs you to sign in again (Settings → Google accounts)" if email in self.needs_signin
                        else "couldn't connect to Google Drive - will retry")
                 activity.add_item(run, "error", ".", f"Account {email or '(none)'} {why}")
+                if plan:
+                    self.changes.mark(key, settle=120, paths=plan["paths"])  # try these again later
             else:
                 try:
                     excludes = list(DEFAULT_EXCLUDES) + list(f.get("exclude", []))
                     s = sync_folder(drive, f["local"], drive_folder=f.get("drive_folder"),
                                     drive_folder_id=f.get("drive_folder_id"),
                                     delete=bool(f.get("delete")), excludes=excludes,
-                                    mode=f.get("mode", "two_way"), progress=prog,
+                                    mode=f.get("mode", "two_way"), progress=prog, quick=plan,
                                     on_event=lambda kind, rel, msg, r=run: activity.add_item(r, kind, rel, msg))
                     if s.get("remote_id"):
                         self.remote_ids[(os.path.normcase(f["local"]), email)] = s["remote_id"]
-                    for k in totals:
-                        totals[k] += s.get(k, 0)
+                    for t in totals:
+                        totals[t] += s.get(t, 0)
+                    self._synced(key, plan, s, started_at)
                 except Exception as e:  # noqa: BLE001
                     log.error("Sync of %s (%s) failed: %s", f["local"], email, e)
                     totals["errors"] += 1
                     activity.add_item(run, "error", ".", f"Sync failed: {e}")
+                    if plan:
+                        self.changes.mark(key, settle=120, paths=plan["paths"])  # try these again later
                     if self._is_auth_error(e):
                         self.drives.pop(email, None)
                         self.needs_signin.add(email)
@@ -440,6 +572,7 @@ class App:
             run["duration"] = round(time.monotonic() - started, 1)
             self._record(run)
         self.progress = None
+        self.file_lines, self.menu_file_lines = [], []
 
         when = time.strftime("%H:%M")
         changes = sum(totals[k] for k in ("uploaded", "updated", "trashed", "downloaded", "deleted_local",
@@ -467,6 +600,26 @@ class App:
         if changes and cfg.get("notify_on_changes"):
             self.notify(f"Synced: {summary}")
         return True
+
+    def _synced(self, key, plan: dict | None, stats: dict, started_at: float) -> None:
+        """Update the saved state after a folder synced: its Drive changes are handled now (unless
+        something failed - then they're looked at again), and when it was last fully checked."""
+        k = self._state_key(key)
+        if stats.get("scope") == "full" and key[1] in self.change_tokens:
+            self.sync_state["last_full"][k] = started_at
+        if stats.get("errors"):
+            # Keep the Drive changes; the PC side is found again by the size/time comparison
+            # (a file that failed isn't recorded as synced).
+            if plan:
+                self.changes.mark(key, settle=120, paths=plan["paths"])
+        else:
+            handled = set(plan["ids"]) if plan else set(self.sync_state["pending"].get(k, ()))
+            left = set(self.sync_state["pending"].get(k, ())) - handled
+            if left:
+                self.sync_state["pending"][k] = sorted(left)
+            else:
+                self.sync_state["pending"].pop(k, None)
+        self._save_sync_state()
 
     # --------------------------------------------------------------- actions
     def sync_now(self):

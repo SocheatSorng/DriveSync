@@ -35,7 +35,8 @@ def is_excluded(path: str, root: str, excludes: list[str]) -> bool:
 
 
 class _Handler(FileSystemEventHandler):
-    def __init__(self, key: Hashable, root: str, excludes: list[str], on_change: Callable[[Hashable], None],
+    def __init__(self, key: Hashable, root: str, excludes: list[str],
+                 on_change: Callable[[Hashable, list[str]], None],
                  ignore_under: tuple[str, ...] = ()):
         self.key, self.root, self.excludes, self.on_change = key, os.path.normpath(root), excludes, on_change
         self.ignore_under = tuple(os.path.normcase(os.path.normpath(p)) + os.sep for p in ignore_under)
@@ -74,13 +75,13 @@ class _Handler(FileSystemEventHandler):
             changed = [self._content_changed(p) for p in relevant]
             if event.event_type != "created" and not any(changed):
                 return
-        self.on_change(self.key)
+        self.on_change(self.key, relevant)
 
 
 class FolderWatcher:
-    """Watches several folders; calls on_change(key) from a background thread."""
+    """Watches several folders; calls on_change(key, changed_paths) from a background thread."""
 
-    def __init__(self, on_change: Callable[[Hashable], None], ignore_under: tuple[str, ...] = ()):
+    def __init__(self, on_change: Callable[[Hashable, list[str]], None], ignore_under: tuple[str, ...] = ()):
         self.on_change = on_change
         self.ignore_under = ignore_under   # never react to changes here (the app's own files)
         self.observer = Observer()
@@ -130,18 +131,32 @@ class FolderWatcher:
 class ChangeTracker:
     """Remembers which folders changed and when; hands them out once they've settled."""
 
+    MAX_PATHS = 5000  # beyond this, remembering paths isn't worth it: check the folder's whole tree
+
     def __init__(self, settle: float = SETTLE_SECONDS, clock: Callable[[], float] = time.monotonic):
         self.settle, self.clock = settle, clock
         self.due: dict[Hashable, float] = {}  # folder -> clock time when it may be synced
+        self.paths: dict[Hashable, set[str] | None] = {}  # folder -> changed paths (None = too many)
         self.lock = threading.Lock()
 
-    def mark(self, key: Hashable, settle: float | None = None) -> None:
-        """A change happened. settle: quiet time needed (default: SETTLE_SECONDS for files on this PC;
-        Drive-side changes use a shorter one). Never shortens a wait that's already longer, so a
-        file still being saved on this PC is not synced early."""
+    def mark(self, key: Hashable, settle: float | None = None, paths=()) -> None:
+        """A change happened (to `paths`, if known). settle: quiet time needed (default: SETTLE_SECONDS
+        for files on this PC; Drive-side changes use a shorter one). Never shortens a wait that's
+        already longer, so a file still being saved on this PC is not synced early."""
         due = self.clock() + (self.settle if settle is None else settle)
         with self.lock:
             self.due[key] = max(due, self.due.get(key, due))
+            if paths:
+                got = self.paths.setdefault(key, set())
+                if got is not None:
+                    got.update(paths)
+                    if len(got) > self.MAX_PATHS:
+                        self.paths[key] = None
+
+    def take_paths(self, key: Hashable) -> set[str] | None:
+        """Paths changed in this folder since the last call; None = too many to list (check it all)."""
+        with self.lock:
+            return self.paths.pop(key, set())
 
     def take_settled(self) -> set[Hashable]:
         """Folders whose wait is over (removed from the pending set)."""
@@ -160,3 +175,4 @@ class ChangeTracker:
     def clear(self) -> None:
         with self.lock:
             self.due.clear()
+            self.paths.clear()

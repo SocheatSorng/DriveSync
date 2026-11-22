@@ -52,7 +52,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --locked --only-group dev
-      - run: uv run --no-sync bandit -c pyproject.toml -r drive_sync.py tray_app.py gui.py accounts.py browsers.py watcher.py activity.py activity_view.py twoway.py progress.py
+      - run: uv run --no-sync bandit -c pyproject.toml -r drive_sync.py tray_app.py gui.py accounts.py browsers.py watcher.py activity.py activity_view.py twoway.py progress.py downloader.py logo.py
 
   dependencies:
     name: pip-audit (vulnerable packages)

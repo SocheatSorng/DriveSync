@@ -10,7 +10,7 @@
     2. Installs the Python packages it needs
     3. Writes config.json with your folder(s) (only if -Folder is given)
     4. Adds a shortcut to your Startup folder (runs with pythonw = no console window)
-    5. Starts it now - look for the blue arrow icon in the system tray
+    5. Starts it now - look for the green DS icon in the system tray
 #>
 param(
     [string[]]$Folder,
@@ -36,7 +36,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe'" |
 
 # --- copy files ------------------------------------------------------------
 New-Item -ItemType Directory -Force $dest | Out-Null
-foreach ($f in "drive_sync.py", "tray_app.py", "gui.py", "accounts.py", "browsers.py", "watcher.py", "activity.py", "activity_view.py", "twoway.py", "progress.py", "requirements.txt", "README.md", "uninstall.ps1") {
+foreach ($f in "drive_sync.py", "tray_app.py", "gui.py", "accounts.py", "browsers.py", "watcher.py", "activity.py", "activity_view.py", "twoway.py", "progress.py", "downloader.py", "logo.py", "requirements.txt", "README.md", "uninstall.ps1") {
     Copy-Item (Join-Path $src $f) $dest -Force
 }
 Copy-Item (Join-Path $src "assets") $dest -Recurse -Force
