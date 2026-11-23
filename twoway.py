@@ -86,6 +86,11 @@ def _join(rel_dir: str, name: str) -> str:
     return f"{rel_dir}/{name}" if rel_dir else name
 
 
+def _pc_name(item: dict) -> str:
+    """The name a Drive item has on this PC (Windows can't store some Drive names as they are)."""
+    return gdocs.link_name(item) if gdocs.is_native(item) else gdocs.local_name(item["name"])
+
+
 def _parent(rel: str) -> str:
     return rel.rsplit("/", 1)[0] if "/" in rel else ""
 
@@ -176,7 +181,7 @@ class TwoWaySyncer(StorageFullMixin):
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"version": STATE_VERSION, "root": self.root_id, "links": True,
+        tmp.write_text(json.dumps({"version": STATE_VERSION, "root": self.root_id, "links": self.links_known,
                                    "base": self.base}),
                        encoding="utf-8")
         tmp.replace(self.state_path)
@@ -397,6 +402,10 @@ class TwoWaySyncer(StorageFullMixin):
                     self._settle_moves()
                 finally:
                     self._finish_downloads(wait=True)   # record every download before saving state
+            if targets is None:
+                # Every folder was looked at, so every Google Doc has its shortcut now. Not set any
+                # earlier: a full check stopped half-way (app closed, paused) must run again next time.
+                self.links_known = True
         finally:
             self.pool = None
             self._save()
@@ -422,7 +431,7 @@ class TwoWaySyncer(StorageFullMixin):
             for item in self.drive.list_children(remote_id):
                 if not self._is_syncable_remote(item) or self._excluded(item["name"], _join(rel_dir, item["name"])):
                     continue
-                name = gdocs.link_name(item) if gdocs.is_native(item) else item["name"]
+                name = _pc_name(item)
                 remote.setdefault(name.casefold(), item)  # duplicates on Drive: use the first
         except Exception as e:  # noqa: BLE001
             self._fail(rel_dir, "Couldn't read folder", e)
@@ -440,7 +449,7 @@ class TwoWaySyncer(StorageFullMixin):
 
         for key in sorted(set(local) | set(remote) | set(known)):
             L, R = local.get(key), remote.get(key)
-            name = L.name if L else (gdocs.link_name(R) if gdocs.is_native(R) else R["name"]) if R else known[key]
+            name = L.name if L else _pc_name(R) if R else known[key]
             rel = _join(rel_dir, name)
             try:
                 self._item(L, R, self.base.get(rel), rel, local_dir, remote_id, name, deep)
@@ -558,7 +567,7 @@ class TwoWaySyncer(StorageFullMixin):
                 items = self._children_of(list(level))
                 nxt = {}
                 for item in items:
-                    r = _join(level[item["_parent"]], item["name"])
+                    r = _join(level[item["_parent"]], _pc_name(item))
                     if self._excluded(item["name"], r):
                         continue
                     if item["mimeType"] == FOLDER_MIME:

@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gdocs
 from drive_sync import DEFAULT_EXCLUDES, Syncer
@@ -15,6 +16,18 @@ from test_twoway import FakeDrive
 from twoway import TwoWaySyncer
 
 SHEET = "application/vnd.google-apps.spreadsheet"
+
+
+class LocalNameTests(unittest.TestCase):
+    def test_names_windows_cannot_store(self):
+        self.assertEqual(gdocs.local_name("Micomet "), "Micomet")
+        self.assertEqual(gdocs.local_name("Notes..."), "Notes")
+        self.assertEqual(gdocs.local_name("a:b?c*.txt"), "a_b_c_.txt")
+        self.assertEqual(gdocs.local_name("CON"), "_CON")
+        self.assertEqual(gdocs.local_name("nul.txt"), "_nul.txt")
+        self.assertEqual(gdocs.local_name("   "), "Untitled")
+        self.assertEqual(gdocs.local_name("Console"), "Console")
+        self.assertEqual(gdocs.local_name("Photos 2026"), "Photos 2026")
 
 
 class GDocHelpers(unittest.TestCase):
@@ -151,6 +164,18 @@ class TwoWayGDocTests(unittest.TestCase):
         self.drive.take_changes()                               # the Doc isn't in Drive's change list
         self.assertEqual(self.sync(quick=True), [("downloaded", "Script/Enrollment.gsheet.url")])
         self.assertEqual(self.sync(quick=True), [])
+
+    def test_full_check_stopped_half_way_runs_again(self):
+        data = json.loads(self.state.read_text())
+        data.pop("links")
+        self.state.write_text(json.dumps(data))
+        self.drive.take_changes()
+        with mock.patch.object(TwoWaySyncer, "_settle_moves", side_effect=RuntimeError("app closed")):
+            with self.assertRaises(RuntimeError):
+                self.sync(quick=True)                           # stopped before the end (state still saved)
+        self.assertFalse(json.loads(self.state.read_text()).get("links"))
+        self.sync(quick=True)                                   # so the next start checks everything again
+        self.assertTrue(json.loads(self.state.read_text())["links"])
 
 
 class UploadOnlyGDocTests(unittest.TestCase):

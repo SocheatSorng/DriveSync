@@ -48,10 +48,22 @@ def _kind(item: dict) -> tuple[str, str]:
     return _KINDS.get(item["mimeType"][len(NATIVE):], _OTHER)
 
 
+_RESERVED = re.compile(r"^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$", re.IGNORECASE)
+
+
+def local_name(name: str) -> str:
+    """A Drive name as Windows can store it. Drive allows names Windows can't: a trailing space or
+    dot (Windows silently drops it, so "Photos " became "Photos" and then "Photos " couldn't be
+    found), characters like : ? *, and device names like CON or NUL."""
+    name = _BAD.sub("_", name).rstrip(" .") or "Untitled"
+    if _RESERVED.match(name):
+        name = "_" + name
+    return name
+
+
 def link_name(item: dict) -> str:
     """The shortcut's file name on this PC, e.g. "Enrollment.gsheet.url"."""
-    name = _BAD.sub("_", item["name"]).rstrip(" .") or "Untitled"
-    return f"{name}.{_kind(item)[0]}.url"
+    return f"{local_name(item['name'])}.{_kind(item)[0]}.url"
 
 
 def is_link_name(name: str) -> bool:

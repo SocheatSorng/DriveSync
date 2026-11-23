@@ -192,6 +192,23 @@ class TwoWayTests(unittest.TestCase):
         self.assertEqual(self.sync(), [("downloaded", "Unit 1/plan.docx")])
         self.assertEqual((self.pc / "Unit 1/plan.docx").read_text(), "p2")
 
+    def test_drive_names_windows_cannot_store(self):
+        # Drive allows "Micomet " (trailing space) and "a?b.txt"; Windows drops the space, so the
+        # folder was made as "Micomet" and then "Micomet " couldn't be read ([WinError 3]).
+        self.start()
+        folder = self.drive.create_folder("Micomet ", "root")
+        self.drive.web_add("Micomet ", "pic.jpg", "x")
+        self.drive.web_add("", "what?.txt", "w")
+        ev = self.sync()
+        self.assertEqual(ev, [("downloaded", "Micomet/pic.jpg"), ("downloaded", "what_.txt"),
+                              ("folder", "Micomet")])
+        self.assertEqual((self.pc / "Micomet/pic.jpg").read_text(), "x")
+        self.assertEqual(self.sync(), [])                     # stays in sync, nothing deleted
+        self.assertEqual(self.drive.items[folder]["name"], "Micomet ")   # Drive name untouched
+        self.write("Micomet/new.jpg", "n")                    # new on PC goes into that folder
+        self.assertEqual(self.sync(), [("uploaded", "Micomet/new.jpg")])
+        self.assertEqual(self.drive.tree()["Micomet /new.jpg"], "n")
+
     def test_new_on_drive_downloads_including_folders(self):
         self.start()
         self.drive.web_add("", "Unit 2", "")  # placeholder replaced below
