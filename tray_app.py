@@ -86,13 +86,13 @@ def tray_icon_size() -> int:
         return 16
 
 
-def make_icon(color: str) -> Image.Image:
-    """The DS logo; the letters' color shows the state."""
+def make_icon(color: str | None = None) -> Image.Image:
+    """The logo in full color, or all in one color that shows the state."""
     return logo.draw(tray_icon_size(), color)
 
 
 ICONS = {
-    "idle": make_icon(logo.GREEN),    # green  - up to date
+    "idle": make_icon(),              # navy + coral - up to date
     "syncing": make_icon("#ffb020"),  # amber  - working
     "error": make_icon("#ff4d4f"),    # red    - needs attention
     "paused": logo.draw_paused(tray_icon_size()),  # grey + pause badge - paused

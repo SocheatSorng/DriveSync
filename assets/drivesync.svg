@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1200 1000">
+  <!-- The Drive Sync logo: a folder (navy, this PC) folding into a cloud (coral, Google Drive).
+       logo.py draws the same shapes with Pillow; keep the two in step. -->
+  <defs>
+    <linearGradient id="navy" x1="0" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#2B3FA0"/>
+      <stop offset="1" stop-color="#1E2A78"/>
+    </linearGradient>
+    <linearGradient id="coral" x1="0.05" y1="0.95" x2="0.95" y2="0.05">
+      <stop offset="0" stop-color="#FF493F"/>
+      <stop offset="0.55" stop-color="#FF6657"/>
+      <stop offset="1" stop-color="#FFB15F"/>
+    </linearGradient>
+    <clipPath id="folderClip">
+      <path d="M180 0 C92 0 30 56 30 145 L30 850 C30 940 82 1000 180 1000 L820 1000
+               C1040 1000 1190 850 1190 650 C1190 552 1147 472 1100 420
+               C1085 286 1000 220 875 220 L650 220 C580 220 550 0 430 0 Z"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#folderClip)">
+    <rect x="0" y="0" width="1200" height="1000" fill="url(#navy)"/>
+    <path d="M78 1000 L650 220 L875 220 C1000 220 1085 286 1100 420 C1147 472 1190 552 1190 650
+             C1190 850 1040 1000 820 1000 Z" fill="url(#coral)"/>
+    <path d="M78 1000 L650 220" fill="none" stroke="#FFD16D" stroke-width="17" stroke-linecap="round"/>
+    <path d="M78 1000 L650 220" fill="none" stroke="#FFF0B0" stroke-width="4" stroke-linecap="round" opacity="0.9"/>
+    <path d="M30 145 C30 56 92 0 180 0" fill="none" stroke="#8A9BFF" stroke-width="8" opacity="0.48"/>
+  </g>
+</svg>
