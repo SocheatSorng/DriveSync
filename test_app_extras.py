@@ -94,9 +94,15 @@ class AnimationTests(unittest.TestCase):
         self.assertFalse(app.should_spin())
 
     def test_frames_are_drawn_for_the_tray(self):
-        self.assertEqual(len(tray_app.SYNC_FRAMES), 8)
+        self.assertEqual(len(tray_app.SYNC_FRAMES), 20)
         self.assertEqual(tray_app.SYNC_FRAMES[0].size, tray_app.ICONS["syncing"].size)
         self.assertNotEqual(tray_app.SYNC_FRAMES[0].tobytes(), tray_app.SYNC_FRAMES[2].tobytes())
+
+    def test_syncing_shows_the_full_color_logo_not_amber(self):
+        # the light covers only part of the outline, so most of the logo matches the idle icon
+        idle, frame = tray_app.ICONS["idle"].tobytes(), tray_app.SYNC_FRAMES[5].tobytes()
+        same = sum(a == b for a, b in zip(idle[::4], frame[::4])) / (len(idle) // 4)
+        self.assertGreater(same, 0.5)
 
 
 class RemoveDataTests(unittest.TestCase):

@@ -91,14 +91,14 @@ def make_icon(color: str | None = None) -> Image.Image:
     return logo.draw(tray_icon_size(), color)
 
 
+SYNC_FRAMES = logo.draw_syncing_frames(tray_icon_size())  # a light runs round the logo - files moving
+FRAME_SECONDS = 0.075                                     # 20 frames: one lap in 1.5 seconds
 ICONS = {
-    "idle": make_icon(),              # full color  - up to date
-    "syncing": make_icon("#ffb020"),  # amber  - working
-    "error": make_icon("#ff4d4f"),    # red    - needs attention
+    "idle": make_icon(),              # full color - up to date
+    "syncing": SYNC_FRAMES[0],        # full color, light on its outline - working
+    "error": make_icon("#ff4d4f"),    # red        - needs attention
     "paused": logo.draw_paused(tray_icon_size()),  # grey + pause badge - paused
 }
-SYNC_FRAMES = logo.draw_syncing_frames(tray_icon_size())  # amber + spinning badge - files moving
-FRAME_SECONDS = 0.125                                     # 8 frames a second: one turn a second
 
 
 def animations_enabled() -> bool:

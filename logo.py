@@ -2,8 +2,9 @@
 joined by a glowing yellow fold, with a glossy sheen and a light rim that stands out on a dark taskbar.
 
 The shapes are those of assets/drivesync.svg, drawn here with Pillow so the app needs no SVG renderer.
-In full color it is the app's icon and the tray's "up to date" icon; drawn in one color (with the
-fold left as a thin gap) the tray uses it to show its other states (amber, red, grey).
+In full color it is the app's icon and the tray's "up to date" icon; while syncing, a gold light runs
+round its outline. Drawn in one color (with the fold left as a thin gap) it shows errors (red) and,
+with a pause badge, a paused sync (grey).
 `python logo.py` rewrites assets/drivesync.ico (the window and .exe icon).
 """
 from __future__ import annotations
@@ -175,15 +176,50 @@ def draw_paused(size: int, color: str = "#8b949e", badge: str = "#5f6368") -> Im
     return _badged(size, color, badge, bars)
 
 
-def draw_syncing_frames(size: int, color: str = "#ffb020", badge: str = "#5f6368",
-                        frames: int = 8) -> list[Image.Image]:
-    """The logo in amber with a spinning arc on its badge: one image per animation frame."""
+def _outline_loop(big: int, n: int) -> list[tuple[float, float]]:
+    """n points spaced evenly around the logo's outline, on a big x big canvas."""
+    k = big / (_X1 - _X0)
+    oy = (big - (_Y1 - _Y0) * k) / 2 - _Y0 * k
+    pts = _points(_FOLDER, lambda x, y: ((x - _X0) * k, oy + y * k))
+    pts.append(pts[0])
+    seg = [((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 for (ax, ay), (bx, by) in zip(pts, pts[1:])]
+    step, out, i, into = sum(seg) / n, [], 0, 0.0
+    for j in range(n):
+        want = j * step
+        while into + seg[i] < want:
+            into += seg[i]
+            i += 1
+        f = (want - into) / seg[i] if seg[i] else 0
+        out.append((pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f))
+    return out
+
+
+def draw_syncing_frames(size: int, frames: int = 20, light: str = "#FFD84D",
+                        tail: float = 0.4) -> list[Image.Image]:
+    """The full-color logo with a gold light running clockwise around its outline, trailing a
+    fading tail (tail = the share of the outline it covers): one image per animation frame."""
+    base, big, n = draw(size), size * SS, 240
+    loop = _outline_loop(big, n)[::-1]           # the outline runs anticlockwise; the light goes clockwise
+    w = max(SS, size * SS * 0.14)                # about 2 px at 16 px
     out = []
     for i in range(frames):
-        def arc(dr, cx, cy, d, start=i * 360 / frames):
-            r = d * 0.30
-            dr.arc((cx - r, cy - r, cx + r, cy + r), start, start + 270, fill="white", width=max(1, round(d * 0.15)))
-        out.append(_badged(size, color, badge, arc))
+        glow, core = Image.new("L", (big, big), 0), Image.new("L", (big, big), 0)
+        dg, dc = ImageDraw.Draw(glow), ImageDraw.Draw(core)
+        head, length = i * n // frames, round(n * tail)
+        for j in range(length, 0, -1):           # tail end first, so the brighter head draws on top
+            a, b = loop[(head - j) % n], loop[(head - j + 1) % n]
+            fade = (1 - j / length) ** 1.6
+            dg.line((a, b), fill=round(110 * fade), width=round(w * 2.2))
+            dc.line((a, b), fill=round(255 * fade), width=round(w))
+        x, y = loop[head]
+        dg.ellipse((x - w * 1.5, y - w * 1.5, x + w * 1.5, y + w * 1.5), fill=110)
+        dc.ellipse((x - w * 0.7, y - w * 0.7, x + w * 0.7, y + w * 0.7), fill=255)
+        frame = base.copy()
+        for mask in (glow, core):
+            layer = Image.new("RGBA", (big, big), light)
+            layer.putalpha(mask)
+            frame.alpha_composite(layer.resize((size, size), Image.LANCZOS))
+        out.append(frame)
     return out
 
 
