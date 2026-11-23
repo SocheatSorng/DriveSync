@@ -48,7 +48,7 @@ An installed copy **updates itself**. Once a day it checks the Releases page; a 
 
 A plain `DriveSync.exe` is attached to each release too. It runs from anywhere, but only *shows* that an update exists.
 
-**Publishing a release** (maintainers): bump `version.py` and `pyproject.toml` (and the `drive-sync` version in `uv.lock`), commit, then `git tag v1.2.0 && git push origin v1.2.0`. CI builds `DriveSync.exe` and `DriveSync-Setup.exe` (Inno Setup), checks that the tag matches `version.py`, and publishes the release. To build locally, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run `build.ps1`.
+**Publishing a release** (maintainers): bump `version.py` and `pyproject.toml` (and the `drive-sync` version in `uv.lock`), commit, then `git tag v1.2.0 && git push origin v1.2.0`. CI builds `DriveSync-Setup.exe` (Inno Setup, installs the fast-starting one-folder build) and the portable `DriveSync.exe`, checks that the tag matches `version.py`, and publishes the release. To build locally, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run `build.ps1`.
 
 ### Option B: from source (needs Python 3.10+)
 ```powershell
@@ -69,6 +69,11 @@ Both options keep settings, logs and the Google logins in `%LOCALAPPDATA%\DriveS
 | **Folders** | Your synced folders, each with **Open**, **Drive** (opens it in Google Drive), **Edit** and **Remove** buttons |
 | **Settings** | Google accounts (add, remove, sign in again, and which browser profile each one opens in), instant sync on/off, how often to do a full check, notifications, start with Windows, light/dark mode |
 | **Activity** | What Drive Sync did, newest first and grouped by day. One card per folder sync that changed something, showing counts, the reason it ran, and the account. Click **Show items** for the file list. Filter by **All / Changes / Problems**, or search for a file, folder or account. Problems open automatically. Checks that changed nothing aren't listed; the line at the top shows when the last check ran. The newest 1,000 entries are kept across restarts. **Log file** opens the full technical log (`%LOCALAPPDATA%\DriveSync\logs\drive_sync.log`): every file uploaded, downloaded, moved or trashed, each status change, and every problem with its reason. It keeps about 25 MB (5 files of 5 MB). Unexpected errors are written there with full details, and a run that was force-closed or crashed is noted at the next start. |
+
+The window is built with Qt (PySide6). The previous CustomTkinter window is still included for one
+release as a fallback: to use it, set the environment variable `DRIVESYNC_UI=tk` and restart Drive Sync
+(in PowerShell: `[Environment]::SetEnvironmentVariable("DRIVESYNC_UI", "tk", "User")`; set it back to
+nothing to return to the new window).
 
 Closing the window keeps Drive Sync running in the **system tray**. Look in the `^` overflow area of the taskbar, or drag the icon onto the taskbar to keep it visible. Double-click the tray icon to open the window. Right-click it for **Sync now**, **Pause** and **Quit**.
 
@@ -118,7 +123,7 @@ When run from source, the command line uses `credentials.json` and `token.json` 
 | `.github/workflows/codeql.yml` | GitHub **CodeQL** follows data through the Python code and the workflows. Results appear in the repo's **Security → Code scanning** tab. It's free for public repos; private repos need GitHub Code Security. |
 | `.github/dependabot.yml` | Opens pull requests when GitHub Actions or packages in `uv.lock` have updates. It waits 7 days after a new release first, as protection against compromised releases. |
 | `.pre-commit-config.yaml` | Runs Gitleaks, Ruff, Bandit and zizmor, and keeps `uv.lock` and `requirements.txt` in sync, on your PC **before each commit**. |
-| `build.ps1` | Builds `dist\DriveSync.exe`. |
+| `build.ps1` | Builds `dist\DriveSync\` (one folder, what Setup installs), the portable `dist\DriveSync.exe` and `dist\DriveSync-Setup.exe`. What goes in is set by `DriveSync.spec` + `build_filter.py`. |
 
 **How the workflows are hardened:**
 - Every job starts with **Harden-Runner** (step-security), which records every network connection the build machine makes. On GitHub-hosted Windows runners this works in audit mode only, and it's free for public repos.
@@ -131,7 +136,7 @@ Run the checks locally (first install uv with `pip install uv` or from <https://
 uv sync                                   # creates .venv with exactly what uv.lock says
 uv run ruff check .
 uv run python -m unittest -v
-uv run bandit -c pyproject.toml -r drive_sync.py tray_app.py gui.py accounts.py browsers.py watcher.py activity.py activity_view.py twoway.py progress.py downloader.py
+uv run bandit -c pyproject.toml -r drive_sync.py tray_app.py gui.py accounts.py browsers.py watcher.py activity.py activity_view.py twoway.py progress.py downloader.py logo.py ui_host.py ui_model.py space_model.py skip_model.py space.py qtui
 uv run pip-audit -r requirements.txt --require-hashes --disable-pip
 uv run zizmor .github/workflows
 uv run pre-commit install                 # once per clone (needs a git repository)

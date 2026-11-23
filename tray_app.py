@@ -22,7 +22,6 @@ import threading
 import time
 from pathlib import Path
 
-import customtkinter as ctk
 import pystray
 from PIL import Image
 
@@ -32,6 +31,7 @@ import browsers
 import logo
 import logs
 import metered
+import ui_host
 import updater
 from downloader import PARALLEL
 from downloader import apply_settings as apply_network_settings
@@ -242,14 +242,9 @@ class App:
         self.cfg = self.load_config()
         self.apply_network(self.cfg)
 
-        ctk.set_appearance_mode(self.cfg.get("appearance", "System").lower())
-        ctk.set_default_color_theme("blue")
-        self.root = ctk.CTk()
-        self.root.report_callback_exception = logs.tk_callback_error   # no console: errors go to the log
-        if start_hidden:
-            self.root.withdraw()
-        from gui import MainWindow  # after CTk() exists
-        self.window = MainWindow(self.root, self, build=not start_hidden)  # built when first opened
+        # The window: Qt (default) or the classic CustomTkinter one (DRIVESYNC_UI=tk) - see ui_host.py.
+        self.host = ui_host.make_host(self, start_hidden, ICO_PATH)
+        self.window = self.host.window
 
         self.icon = pystray.Icon("DriveSync", ICONS["idle"], "Drive Sync", menu=pystray.Menu(
             pystray.MenuItem(lambda _: self.status, None, enabled=False),
@@ -1232,7 +1227,7 @@ class App:
             self.watcher.stop()
             self.icon.stop()
         finally:
-            self.root.destroy()
+            self.host.stop()
 
     def run(self):
         self.refresh_watchers()
@@ -1243,8 +1238,7 @@ class App:
         if getattr(sys, "frozen", False) and self.startup_enabled():
             # Point the Windows-startup shortcut at this copy (e.g. after moving to the installed one).
             threading.Thread(target=self.set_startup, args=(True,), daemon=True).start()
-        self.root.after(150, self.window.poll)
-        self.root.mainloop()
+        self.host.run()
 
 
 # --------------------------------------------------------------------------- #
@@ -1298,8 +1292,9 @@ def main() -> int:
     logs.setup(LOG_PATH)
     logs.install_crash_hooks()
     SHOW_FLAG.unlink(missing_ok=True)
-    log.info("Drive Sync %s started%s (process %d, %s)", __version__, " in the tray" if args.hidden else "",
-             os.getpid(), sys.executable if getattr(sys, "frozen", False) else "from source")
+    log.info("Drive Sync %s started%s (process %d, %s, %s window)", __version__,
+             " in the tray" if args.hidden else "", os.getpid(),
+             sys.executable if getattr(sys, "frozen", False) else "from source", ui_host.chosen_ui())
     RUN_MARKER.start()
     try:
         App(start_hidden=args.hidden).run()
