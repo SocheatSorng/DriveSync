@@ -24,6 +24,7 @@ CARD = ("#f1f3f4", "#2b2b2b")
 SURFACE = ("#ffffff", "#333333")        # a card that sits straight on a tab (CARD matches the tab in dark mode)
 BAR_TRACK = ("#e3e3e3", "#3c4043")      # the empty part of a progress bar
 ERROR_TEXT = ("#d93025", "#f28b82")
+WAITING_TEXT = ("#b06000", "#fdd663")   # a new folder waiting for "Start syncing"
 SECONDARY = {"fg_color": "transparent", "border_width": 1, "text_color": ("#1f1f1f", "#e3e3e3"),
              "border_color": ("#c4c7c5", "#5f6368"), "hover_color": ("#e8eaed", "#3c4043")}
 DANGER = {"fg_color": "transparent", "text_color": ("#d93025", "#f28b82"),
@@ -904,6 +905,7 @@ class MainWindow:
                 extra = " · upload only" + (", Drive matches PC" if f.get("delete") else "")
             exists = os.path.isdir(local)
             email = self.app.folder_account(f, known)
+            waiting = self.app.is_waiting(f)
             if not exists:
                 line, color = "⚠  This folder no longer exists on this PC", ERROR_TEXT
             elif not email:
@@ -912,6 +914,10 @@ class MainWindow:
                 line, color = f"⚠  Account {email} was removed - click Edit to choose another", ERROR_TEXT
             elif email in signin:
                 line, color = f"⚠  {email} needs to sign in again (Settings → Google accounts)", ERROR_TEXT
+            elif waiting:
+                arrow = "↔" if f.get("mode", "two_way") == "two_way" else "→"
+                line, color = (f"Waiting - press Start syncing   ·   {arrow}  {email} · {target}{extra}",
+                               WAITING_TEXT)
             else:
                 arrow = "↔" if f.get("mode", "two_way") == "two_way" else "→"  # (⇄ isn't in Segoe UI)
                 line, color = f"{arrow}  {email} · {target}{extra}", MUTED
@@ -929,6 +935,10 @@ class MainWindow:
             autowrap(where, c, margin=40)
             autowrap(info, c, margin=40)
             autowrap(title, c, margin=lambda b=btns: b.winfo_width() + 48)  # beside the buttons
+            if waiting:   # one time only: the folder's first sync runs when this is pressed
+                ctk.CTkButton(btns, text="Start syncing", width=110, height=28, font=font(13, "bold"),
+                              state="normal" if exists and email in known and email not in signin else "disabled",
+                              command=lambda f=f: self.start_folder(f)).pack(side="left", padx=(8, 0))
             for text, cmd, style in (("Open", lambda i=i: self.open_local(i), SECONDARY),
                                      ("Drive", lambda i=i: self.open_drive(i), SECONDARY),
                                      ("Edit", lambda i=i: self.edit_folder(i), SECONDARY),
@@ -1015,10 +1025,14 @@ class MainWindow:
                 messagebox.showinfo("Drive Sync", "That folder is already being synced to this account.",
                                     parent=self.root)
                 return
-            cfg["folders"] = [*cfg["folders"], d.result]
+            # A new folder waits: its first sync runs when "Start syncing" on its card is pressed.
+            cfg["folders"] = [*cfg["folders"], {**d.result, "waiting": True}]
             self.app.save_config(cfg)
             self.refresh_folders()
-            self.app.sync_now()
+
+    def start_folder(self, folder: dict):
+        self.app.start_folder(folder)
+        self.refresh_folders()
 
     def edit_folder(self, i: int):
         cfg = dict(self.app.cfg)
@@ -1110,7 +1124,9 @@ class MainWindow:
             messagebox.showerror("Drive Sync", str(e), parent=self.root)
             return
         self.refresh_account()
-        if not self.app.accounts_info():
+        if not self.app.accounts_info() or messagebox.askyesno(
+                "Drive Sync", "credentials.json imported.\n\nSign in with a Google account now?",
+                parent=self.root):
             self.add_account()
 
     def add_account(self):

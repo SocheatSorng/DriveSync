@@ -1,6 +1,7 @@
 """Tests for timed pauses, Drive storage numbers and metered connections.
 Run:  python -m unittest test_app_extras -v
 """
+import threading
 import time
 import unittest
 from unittest import mock
@@ -15,6 +16,8 @@ def bare_app():
     """An App with only what these features use (no window, no tray icon, no worker)."""
     app = tray_app.App.__new__(tray_app.App)
     app.paused, app.pause_until, app.metered_held, app.animating = False, None, False, False
+    app.sync_running, app.spin_until = False, 0.0
+    app.icon_lock, app.anim_wake = threading.RLock(), threading.Event()
     app.progress = None
     app.state, app.status, app.detail = "idle", "", ""
     app.states, app.notes = [], []
@@ -80,18 +83,104 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(app.notes, [])
 
 
+class FakeAnim:
+    def __init__(self):
+        self.shown = []
+
+    def show(self, i):
+        self.shown.append(i)
+
+
 class AnimationTests(unittest.TestCase):
-    def test_spins_only_while_files_move(self):
-        from progress import Progress
+    def syncing_app(self):
         app = bare_app()
-        app.state, app.progress = "syncing", Progress()
-        self.assertFalse(app.should_spin())             # comparing files: still icon
-        app.progress.transfer("upload", "a.wav", 100)
+        app._sync_began()
+        app.state = "syncing"
+        return app
+
+    def test_spins_for_the_whole_sync_not_only_transfers(self):
+        app = self.syncing_app()
+        self.assertTrue(app.should_spin())              # comparing / trashing - no file moving yet
+        self.assertTrue(app.anim_wake.is_set())         # the animation thread is woken at once
+        later = time.monotonic() + 60
+        self.assertTrue(app.should_spin(later))         # a long sync: still running
+        app._sync_ended()
+        app.state = "idle"
+        self.assertFalse(app.should_spin(later))
+
+    def test_quick_sync_still_shows_one_whole_lap(self):
+        app = self.syncing_app()
+        start = time.monotonic()
+        app._sync_ended()                               # done in well under a second
+        app.state = "idle"
+        self.assertTrue(app.should_spin(start))
+        self.assertFalse(app.should_spin(start + tray_app.SPIN_MIN_SECONDS + 0.01))
+
+    def test_back_to_back_syncs_keep_spinning(self):
+        app = self.syncing_app()
+        app._sync_ended()
+        app.state = "idle"
+        app._sync_began()
+        self.assertTrue(app.should_spin(time.monotonic() + 60))
+
+    def test_pause_stops_the_light_and_resume_brings_it_back(self):
+        app = self.syncing_app()
+        app.pause(None)
+        self.assertFalse(app.should_spin())
+        app.resume()                                    # the sync is still finishing its file
         self.assertTrue(app.should_spin())
-        app.paused = True
+        app.pause(None)
+        app._sync_ended()                               # stopped while paused
+        app.resume()
+        self.assertFalse(app.should_spin())             # no left-over lap after resuming
+
+    def test_no_light_when_metered_or_error(self):
+        app = self.syncing_app()
+        app.metered_held = True
         self.assertFalse(app.should_spin())
-        app.paused, app.state = False, "idle"
+        app.metered_held, app.state = False, "error"   # the red icon isn't hidden by the light
         self.assertFalse(app.should_spin())
+
+    def test_sync_all_marks_the_round_however_it_ends(self):
+        app = bare_app()
+        seen = []
+        app._sync_all = lambda **kw: seen.append(app.sync_running) or True
+        self.assertTrue(app.sync_all(trigger="drive"))
+        self.assertEqual(seen, [True])
+        self.assertFalse(app.sync_running)
+        app._sync_all = mock.Mock(side_effect=RuntimeError("boom"))
+        self.assertFalse(app.sync_all())
+        self.assertFalse(app.sync_running)
+        self.assertEqual(app.states[-1][0], "error")
+
+    def test_tick_shows_frames_then_the_still_icon(self):
+        app = self.syncing_app()
+        app.icon, anim = mock.Mock(), FakeAnim()
+        self.assertTrue(app._animation_tick(anim, True))
+        self.assertTrue(app._animation_tick(anim, True))
+        self.assertEqual(anim.shown, [0, 1])
+        self.assertTrue(app.animating)
+        app._sync_ended()
+        app.state, app.spin_until = "idle", 0.0
+        self.assertFalse(app._animation_tick(anim, True))
+        self.assertFalse(app.animating)
+        self.assertIs(app.icon.icon, tray_app.ICONS["idle"])
+        app._sync_began()
+        app.state = "syncing"
+        app._animation_tick(anim, True)
+        self.assertEqual(anim.shown[-1], 0)             # each sync starts the lap from the top
+        self.assertFalse(app._animation_tick(anim, False))   # Windows animations turned off
+        self.assertIs(app.icon.icon, tray_app.ICONS["syncing"])
+
+    def test_set_state_does_not_cover_a_running_light(self):
+        app = self.syncing_app()
+        app.icon, app.animating = mock.Mock(), True
+        app.icon.icon = "frame"
+        tray_app.App.set_state(app, "syncing", "Syncing… 5%")
+        self.assertEqual(app.icon.icon, "frame")
+        app.animating = False
+        tray_app.App.set_state(app, "idle", "Up to date")
+        self.assertIs(app.icon.icon, tray_app.ICONS["idle"])
 
     def test_frames_are_drawn_for_the_tray(self):
         self.assertEqual(len(tray_app.SYNC_FRAMES), 20)
@@ -156,6 +245,24 @@ class MeteredTests(unittest.TestCase):
             self.assertTrue(app._metered_hold())
             app._check_metered()
             self.assertEqual((app.metered_held, app.states[-1][1]), (True, tray_app.METERED_STATUS))
+
+
+class SignInFailureTextTests(unittest.TestCase):
+    def test_timeout_explains_the_usual_google_error_pages(self):
+        text = tray_app.sign_in_failure_text(Exception("Timed out waiting for response from authorization server"))
+        self.assertIn("Internal", text)
+        self.assertIn("Test users", text)
+
+    def test_other_errors_keep_the_details(self):
+        text = tray_app.sign_in_failure_text(Exception("access_denied"))
+        self.assertIn("Details: access_denied", text)
+
+    def test_disabled_drive_api_links_to_the_enable_page(self):
+        text = tray_app.sign_in_failure_text(Exception(
+            "<HttpError 403 ... returned \"Google Drive API has not been used in project 1091363161830 before "
+            "or it is disabled.\" reason: accessNotConfigured>"))
+        self.assertIn("Drive API is turned off", text)
+        self.assertIn("drive.googleapis.com/overview?project=1091363161830", text)
 
 
 if __name__ == "__main__":

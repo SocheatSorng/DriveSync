@@ -34,6 +34,9 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=force
 RestartApplications=no
+; Windows caches an .exe's icon by path, so after an update Explorer and Task Manager keep showing
+; the old logo. This makes Setup tell Windows to drop that cache when it finishes.
+ChangesAssociations=yes
 VersionInfoVersion={#AppVersion}
 VersionInfoProductName=Drive Sync
 
@@ -52,6 +55,8 @@ Name: "{userdesktop}\Drive Sync"; Filename: "{app}\DriveSync.exe"; Tasks: deskto
 Name: "{userstartup}\Drive Sync"; Filename: "{app}\DriveSync.exe"; Parameters: "--hidden"; Tasks: startup
 
 [Run]
+; Rebuild the per-user icon cache too (the old logo can survive ChangesAssociations alone).
+Filename: "{sys}\ie4uinit.exe"; Parameters: "-show"; Flags: runhidden waituntilterminated skipifdoesntexist
 ; Interactive install: offer to open it. Silent update (from the app): start it again in the tray.
 Filename: "{app}\DriveSync.exe"; Description: "Open Drive Sync"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\DriveSync.exe"; Parameters: "--hidden"; Flags: nowait; Check: WizardSilent

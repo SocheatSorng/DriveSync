@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -93,6 +94,7 @@ def make_icon(color: str | None = None) -> Image.Image:
 
 SYNC_FRAMES = logo.draw_syncing_frames(tray_icon_size())  # a light runs round the logo - files moving
 FRAME_SECONDS = 0.075                                     # 20 frames: one lap in 1.5 seconds
+SPIN_MIN_SECONDS = len(SYNC_FRAMES) * FRAME_SECONDS       # a sync shorter than a lap still shows one lap
 ICONS = {
     "idle": make_icon(),              # full color - up to date
     "syncing": SYNC_FRAMES[0],        # full color, light on its outline - working
@@ -112,7 +114,7 @@ def animations_enabled() -> bool:
 
 
 class TrayAnimation:
-    """Spins the tray icon while files are uploading or downloading.
+    """Runs the light round the tray icon while a sync is in progress.
 
     Each frame's icon handle is made once and handed straight to Windows, so animating doesn't
     write a temporary .ico file per frame (what setting pystray's icon.icon does)."""
@@ -150,6 +152,28 @@ def seconds_until(hour: int, now: float | None = None) -> float:
     return target - time.mktime(t)
 
 
+def sign_in_failure_text(e: Exception) -> str:
+    """What to tell the user when the browser sign-in didn't come back with a login."""
+    if "timed out" in str(e).lower():
+        return ("Sign-in didn't finish: Google never sent the browser back to Drive Sync.\n\n"
+                "This usually means Google showed an error page instead of the approval screen, e.g.:\n"
+                "• “Access blocked … can only be used within its organization” - the OAuth client is in a "
+                "Google Workspace project set to Internal. Use a client from a project whose OAuth consent "
+                "screen is External.\n"
+                "• “Access blocked … has not completed the Google verification process” - add this Google "
+                "account under OAuth consent screen → Test users in Google Cloud Console.\n\n"
+                "Fix that, then press Add Google account again.")
+    if "accessNotConfigured" in str(e) or "has not been used in project" in str(e):
+        project = re.search(r"project[= ](\d+)", str(e))
+        link = ("https://console.developers.google.com/apis/api/drive.googleapis.com/overview"
+                + (f"?project={project.group(1)}" if project else ""))
+        return ("Signed in, but the Google Drive API is turned off in the Google Cloud project that "
+                "credentials.json belongs to.\n\n"
+                f"Open this page, click Enable, wait a minute or two, then press Add Google account again:\n{link}")
+    return ("Sign-in didn't finish. Try again, and approve access in the browser window "
+            f"that opens.\n\nDetails: {e}")
+
+
 def quota_text(q: dict | None) -> str:
     """'12.3 GB of 15.0 GB used (82%)' - or '' when unknown."""
     if not q:
@@ -176,6 +200,10 @@ class App:
         self.pause_until: float | None = None       # time.time() when a timed pause ends (None: until resumed)
         self.metered_held = False                   # waiting: on a metered connection (setting on)
         self.animating = False                      # the tray icon is spinning (TrayAnimation)
+        self.sync_running = False                   # a sync round is in progress (sync_all)
+        self.spin_until = 0.0                       # time.monotonic() the light may stop (one whole lap)
+        self.icon_lock = threading.RLock()          # one thread at a time changes the tray icon
+        self.anim_wake = threading.Event()          # wakes the animation thread when something changes
         self.update: updater.Update | None = None   # a newer version on GitHub
         self.update_status = ""                     # shown in Settings → Updates
         self.update_wake = threading.Event()        # "Check now"
@@ -282,42 +310,70 @@ class App:
             self._logged_state = (state, status, detail)   # each new status once, not every refresh
             (log.warning if state == "error" else log.info)("Status: %s%s", status, f" - {detail}" if detail else "")
         try:
-            if not self.animating:   # while spinning, the animation thread owns the icon
-                self.icon.icon = self.static_icon()
+            with self.icon_lock:
+                if not self.animating:   # while spinning, the animation thread owns the icon
+                    self.icon.icon = self.static_icon()
             tip = f"Drive Sync - {status}" + (f"\n{detail}" if state == "syncing" and detail else "")
             self.icon.title = tip[:127]  # Windows tooltip limit
             self.icon.update_menu()
         except Exception as e:  # noqa: BLE001 - icon may not be running yet
             log.debug("Tray icon not ready: %s", e)
+        self.anim_wake.set()   # paused / error / ... : the animation looks again right away
         self.ui.put(("state",))
 
     def static_icon(self) -> Image.Image:
         return ICONS["paused" if self.paused or self.metered_held else self.state]
 
-    def should_spin(self) -> bool:
-        """Spin only while files are actually moving (not while comparing), and not when paused."""
-        p = self.progress
-        return (self.state == "syncing" and not self.paused and not self.metered_held
-                and p is not None and bool(p.active))
+    def should_spin(self, now: float | None = None) -> bool:
+        """The light runs for the whole of a sync round - comparing, moving files to the trash,
+        downloading - and at least one lap, so a sync that takes half a second is still seen.
+        Never while paused / held on a metered connection, and not over the red error icon."""
+        if self.paused or self.metered_held or self.state == "error":
+            return False
+        return self.sync_running or (now if now is not None else time.monotonic()) < self.spin_until
+
+    def _sync_began(self) -> None:
+        with self.icon_lock:
+            self.sync_running = True
+            self.spin_until = time.monotonic() + SPIN_MIN_SECONDS
+        self.anim_wake.set()
+
+    def _sync_ended(self) -> None:
+        self.sync_running = False
+        self.anim_wake.set()
+
+    def _animation_tick(self, anim: TrayAnimation, allowed: bool) -> bool:
+        """Show the next frame, or the still icon once the light stops. True: keep spinning."""
+        with self.icon_lock:   # so set_state() can't put a still icon over a frame, or the other way round
+            spin = allowed and self.should_spin()
+            if spin:
+                if not self.animating:
+                    self._frame = 0          # every sync starts the lap at the same place
+                self.animating = True
+                anim.show(self._frame)
+                self._frame += 1
+            elif self.animating:
+                self.icon.icon = self.static_icon()   # back to the still icon for the state
+                self.animating = False
+        return spin
 
     def animate(self) -> None:
-        """Runs on its own thread for the life of the app."""
-        anim, frame, allowed, checked = TrayAnimation(self.icon, SYNC_FRAMES), 0, True, 0.0
+        """Runs on its own thread for the life of the app. Sleeps until set_state() / a sync
+        starting or ending wakes it, so the light starts at once instead of up to 0.25 s late."""
+        anim, allowed, checked = TrayAnimation(self.icon, SYNC_FRAMES), True, 0.0
         while not self.stopping.is_set():
+            self.anim_wake.clear()
             if time.monotonic() - checked > 10:      # the Windows setting can change while we run
                 allowed, checked = animations_enabled(), time.monotonic()
-            spin = allowed and self.should_spin()
             try:
-                if spin:
-                    self.animating = True
-                    anim.show(frame)
-                    frame += 1
-                elif self.animating:
-                    self.animating = False
-                    self.icon.icon = self.static_icon()   # back to the still icon for the state
+                spin = self._animation_tick(anim, allowed)
             except Exception as e:  # noqa: BLE001 - icon not ready / gone: try again shortly
                 log.debug("Tray animation: %s", e)
-            self.stopping.wait(FRAME_SECONDS if spin else 0.25)
+                spin = False
+            if spin:
+                self.stopping.wait(FRAME_SECONDS)
+            else:
+                self.anim_wake.wait(0.5)
 
     def notify(self, msg: str) -> None:
         try:
@@ -517,7 +573,7 @@ class App:
         cfg = self.load_config()
         known = accounts.list_accounts()
         by_account: dict[str, list] = {}
-        for f in cfg.get("folders", []):
+        for f in self.active_folders(cfg):
             if f.get("mode", "two_way") == "two_way":
                 email = self.folder_account(f, known)
                 if email in known and email not in self.needs_signin:
@@ -620,6 +676,41 @@ class App:
     def folder_key(folder: dict, known: list[str]) -> tuple[str, str | None]:
         return os.path.normcase(os.path.normpath(folder["local"])), App.folder_account(folder, known)
 
+    @staticmethod
+    def is_waiting(folder: dict) -> bool:
+        """A newly added folder that hasn't been started yet (its card shows "Start syncing")."""
+        return bool(folder.get("waiting"))
+
+    @classmethod
+    def active_folders(cls, cfg: dict) -> list[dict]:
+        """The folders that sync: every folder except those waiting for "Start syncing"."""
+        return [f for f in cfg.get("folders", []) if not cls.is_waiting(f)]
+
+    def waiting_count(self) -> int:
+        return sum(1 for f in self.cfg.get("folders", []) if self.is_waiting(f))
+
+    def start_folder(self, folder: dict) -> bool:
+        """The card's "Start syncing" button: the folder stops waiting and its first sync (a full
+        check of every file) runs now. False if the folder is no longer in the settings."""
+        known = accounts.list_accounts()
+        key = self.folder_key(folder, known)
+        cfg = dict(self.cfg)
+        found = False
+        folders = []
+        for f in cfg.get("folders", []):
+            if self.is_waiting(f) and self.folder_key(f, known) == key:
+                f = {k: v for k, v in f.items() if k != "waiting"}
+                found = True
+            folders.append(f)
+        if not found:
+            return False
+        cfg["folders"] = folders
+        log.info("Starting to sync %s", folder.get("local"))
+        self.save_config(cfg)              # also starts watching it
+        self.changes.mark(key, settle=0)   # synced at once, on its own (not yet fully checked: every file)
+        self.wake.set()
+        return True
+
     def _on_folder_changed(self, key, paths) -> None:  # called from the watcher thread
         self.changes.mark(key, paths=paths)
         self.wake.set()
@@ -632,7 +723,7 @@ class App:
         wanted = {}
         if cfg.get("watch_changes", True):
             known = accounts.list_accounts()
-            for f in cfg.get("folders", []):
+            for f in self.active_folders(cfg):   # a folder waiting for "Start syncing" isn't watched
                 excludes = list(DEFAULT_EXCLUDES) + list(f.get("exclude", []))
                 wanted[self.folder_key(f, known)] = (os.path.normpath(f["local"]), excludes)
         try:
@@ -740,6 +831,7 @@ class App:
     def sync_all(self, *args, **kwargs) -> bool:
         """One sync round. An unexpected error is logged and shown, and syncing carries on later
         (it used to end the background thread, so nothing synced until a restart)."""
+        self._sync_began()   # the tray light runs until the round ends, however it ends
         try:
             return self._sync_all(*args, **kwargs)
         except Exception as e:  # noqa: BLE001
@@ -747,6 +839,8 @@ class App:
             self.progress = None
             self.set_state("error", "Sync stopped by an unexpected error", f"{e} - see the log file")
             return False
+        finally:
+            self._sync_ended()
 
     def _sync_all(self, only: set | None = None, trigger: str = "scheduled", full: bool = False,
                  scan: bool = False) -> bool:
@@ -767,6 +861,10 @@ class App:
         folders = cfg["folders"]
         if not folders:
             self.set_state("idle", "No folders yet", "Add a folder to start backing up")
+            return True
+        folders = self.active_folders(cfg)   # new folders wait for "Start syncing"
+        if not folders:
+            self.set_state("idle", "Waiting - press Start syncing", "on the folder's card (Folders tab)")
             return True
 
         if only is not None:
@@ -895,7 +993,11 @@ class App:
             return False
         watching = self.watcher.watched
         live = f" · watching {watching} folder{'s' if watching != 1 else ''} for changes" if watching else ""
-        self.set_state("idle", "Up to date", f"Last sync {when}" + (f" - {summary}" if changes else "") + live)
+        waiting = sum(1 for f in cfg["folders"] if self.is_waiting(f))
+        wait = (f" · {waiting} new folder{'s' if waiting != 1 else ''} waiting - press Start syncing"
+                if waiting else "")
+        self.set_state("idle", "Up to date",
+                       f"Last sync {when}" + (f" - {summary}" if changes else "") + live + wait)
         if changes and cfg.get("notify_on_changes"):
             self.notify(f"Synced: {summary}")
         return True
@@ -957,6 +1059,7 @@ class App:
         """Pause syncing - for `seconds`, or until resumed (None)."""
         self.paused = True
         self.pause_until = time.time() + seconds if seconds else None
+        self.spin_until = 0.0   # no rest of a lap after resuming unless a sync is still running
         self._show_pause_change()
         self.wake.set()   # the worker sleeps until the pause ends
 
@@ -1030,6 +1133,7 @@ class App:
         threading.Thread(target=self._sign_in_thread, args=(login_hint, browser_profile), daemon=True).start()
 
     def _sign_in_thread(self, login_hint: str | None, browser_profile: str | None = None):
+        log.info("Sign-in started (%s) - waiting for the browser", login_hint or "new account")
         try:
             creds = accounts.sign_in(CREDS_PATH, login_hint=login_hint, browser_profile=browser_profile)
             email = accounts.account_email(build_service(creds))
@@ -1043,8 +1147,7 @@ class App:
         except Exception as e:  # noqa: BLE001 - closed the tab, timed out, denied access, ...
             log.error("Sign-in didn't finish: %s", e)
             self.record_event("warning", "Sign-in didn't finish", str(e)[:300])
-            self.ui.put(("error", "Sign-in didn't finish. Try again, and approve access in the browser window "
-                                  f"that opens.\n\nDetails: {e}"))
+            self.ui.put(("error", sign_in_failure_text(e)))
         finally:
             self.signing_in = None
             self.ui.put(("account",))
