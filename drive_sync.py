@@ -27,6 +27,8 @@ import threading
 import time
 from pathlib import Path
 
+import gdocs
+
 # Full Drive access: needed to browse and sync into folders you created yourself (and shared
 # folders / shared drives). Tokens granted with an older, narrower scope must sign in again.
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -579,6 +581,8 @@ class Syncer(StorageFullMixin):
             if entry.is_symlink():
                 log.debug("Skipping symlink %s", rel)
                 continue
+            if gdocs.is_link_name(entry.name) and gdocs.read_link(Path(entry.path)):
+                continue  # shortcut to a Google Doc left by two-way sync: the Doc is on Drive already
             existing = by_name.get(entry.name, [])
             try:
                 if entry.is_dir():

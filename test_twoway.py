@@ -276,16 +276,15 @@ class TwoWayTests(unittest.TestCase):
         self.assertEqual(len(local_tree(self.pc)), 4)     # nothing touched
         self.assertEqual(list(self.bin.iterdir()), [])
 
-    def test_google_docs_are_left_alone(self):
+    def test_google_docs_become_shortcuts_and_go_with_their_folder(self):
         self.start()
         self.drive.web_add("Unit 1", "Lesson notes", "")
         self.drive.items[self.drive.find("Unit 1/Lesson notes")].pop("md5Checksum")
         self.drive.items[self.drive.find("Unit 1/Lesson notes")]["mimeType"] = "application/vnd.google-apps.document"
-        self.assertEqual(self.sync(), [])                 # not downloaded
-        shutil.rmtree(self.pc / "Unit 1")                 # folder deleted on PC...
-        ev = self.sync()
-        self.assertIn("Unit 1/Lesson notes", self.drive.tree())  # ...but the Google Doc isn't trashed
-        self.assertIn(("trashed", "Unit 1/plan.docx"), ev)
+        self.assertEqual(self.sync(), [("downloaded", "Unit 1/Lesson notes.gdoc.url")])
+        shutil.rmtree(self.pc / "Unit 1")                 # folder deleted on PC (shortcut included)...
+        self.assertEqual(self.sync(), [("trashed", "Unit 1")])
+        self.assertEqual(self.drive.tree(), {"notes.txt": "n1"})  # ...so the Doc goes to the trash with it
 
     def test_progress_is_saved_during_a_long_sync(self):
         # If the app is closed or crashes half-way, the next start must not start from nothing.

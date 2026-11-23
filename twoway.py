@@ -14,6 +14,9 @@ and decide:
     deleted on PC    (B, no L, R unchanged) -> move the Drive copy to the Drive trash
     deleted on one side but edited on the other -> keep the edited file (copy it back)
 
+Google Docs/Sheets/Slides etc. appear on this PC as small shortcuts that open them in the
+browser (see gdocs.py); deleting, renaming or moving a shortcut does the same on Drive.
+
 Nothing is ever deleted permanently. If the Drive folder itself has been deleted or
 trashed, the sync stops before touching anything on this PC.
 """
@@ -28,6 +31,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import gdocs
 from downloader import PARALLEL
 from drive_sync import FOLDER_MIME, NotEnoughSpace, StorageFullMixin, log_event, md5_of
 from progress import Paused
@@ -140,6 +144,9 @@ class TwoWaySyncer(StorageFullMixin):
         self.new_on_pc: list = []          # (rel, path, parent_id, md5, sig)
         self.gone_files: list = []         # (rel, R, B) files deleted on this PC
         self.gone_dirs: list = []          # (rel, R) folders deleted on this PC
+        self.new_links: list = []          # (rel, path, parent_id, Drive id) Google Doc shortcuts new here
+        self.gone_links: list = []         # (rel, R) Google Docs whose shortcut was deleted on this PC
+        self.links_known = False           # state saved by a version that puts Google Docs on this PC
         self._by_size: dict[int, list[str]] | None = None   # synced files by size (see _could_be_moved)
         self.base: dict[str, dict] = self._load_base(migrate_from)
         self.can_move = self.can_move and bool(self.base)
@@ -152,6 +159,7 @@ class TwoWaySyncer(StorageFullMixin):
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
             if data.get("version") == STATE_VERSION and data.get("root") == self.root_id:
+                self.links_known = bool(data.get("links"))
                 return data.get("base", {})
         except (OSError, ValueError):
             pass
@@ -168,7 +176,8 @@ class TwoWaySyncer(StorageFullMixin):
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"version": STATE_VERSION, "root": self.root_id, "base": self.base}),
+        tmp.write_text(json.dumps({"version": STATE_VERSION, "root": self.root_id, "links": True,
+                                   "base": self.base}),
                        encoding="utf-8")
         tmp.replace(self.state_path)
 
@@ -267,8 +276,8 @@ class TwoWaySyncer(StorageFullMixin):
 
     @staticmethod
     def _is_syncable_remote(item: dict) -> bool:
-        # Google Docs/Sheets/Slides, shortcuts etc. have no file content to download.
-        return item["mimeType"] == FOLDER_MIME or "md5Checksum" in item
+        # Google Docs/Sheets/Slides etc. have no content: they become shortcuts (gdocs.py).
+        return item["mimeType"] == FOLDER_MIME or "md5Checksum" in item or gdocs.is_native(item)
 
     # -- quick sync: find what changed --------------------------------------------
     def _known_dir(self, rel: str) -> str | None:
@@ -326,8 +335,11 @@ class TwoWaySyncer(StorageFullMixin):
     def targets_for(self, paths=(), drive_ids=(), scan: bool = False) -> set[str] | None:
         """The folders a quick sync has to look at, or None if everything must be checked
         (first sync, or sync state from an older version)."""
-        if not self.base or any(b.get("t") == "d" and not b.get("id") for b in self.base.values()):
-            return None                     # never synced, or state from upload-only mode: check it all
+        if not self.base or not self.links_known or any(b.get("t") == "d" and not b.get("id")
+                                                        for b in self.base.values()):
+            # never synced, state from upload-only mode, or from before Google Docs were put on
+            # this PC (every folder must be looked at once to add them): check it all
+            return None
         found = set(self.scan_local()) if scan else set()
         root = os.path.normcase(os.path.abspath(self.local_root))
         for p in paths:                     # changed on this PC: look at the folder that holds it
@@ -410,7 +422,8 @@ class TwoWaySyncer(StorageFullMixin):
             for item in self.drive.list_children(remote_id):
                 if not self._is_syncable_remote(item) or self._excluded(item["name"], _join(rel_dir, item["name"])):
                     continue
-                remote.setdefault(item["name"].casefold(), item)  # duplicates on Drive: use the first
+                name = gdocs.link_name(item) if gdocs.is_native(item) else item["name"]
+                remote.setdefault(name.casefold(), item)  # duplicates on Drive: use the first
         except Exception as e:  # noqa: BLE001
             self._fail(rel_dir, "Couldn't read folder", e)
             return
@@ -427,7 +440,7 @@ class TwoWaySyncer(StorageFullMixin):
 
         for key in sorted(set(local) | set(remote) | set(known)):
             L, R = local.get(key), remote.get(key)
-            name = L.name if L else R["name"] if R else known[key]
+            name = L.name if L else (gdocs.link_name(R) if gdocs.is_native(R) else R["name"]) if R else known[key]
             rel = _join(rel_dir, name)
             try:
                 self._item(L, R, self.base.get(rel), rel, local_dir, remote_id, name, deep)
@@ -455,6 +468,8 @@ class TwoWaySyncer(StorageFullMixin):
             return
         if l_dir or r_dir or (L is None and R is None and B and B.get("t") == "d"):
             self._folder(L, R, B, rel, local_dir / name, remote_id, name, deep)
+        elif self._is_link(L, R, B):
+            self._gdoc(L, R, B, rel, local_dir / name, remote_id)
         else:
             if L is None and R is not None and self.progress:
                 self.progress.add_total(1, int(R.get("size") or 0))  # on Drive only: not counted yet
@@ -520,6 +535,8 @@ class TwoWaySyncer(StorageFullMixin):
                 if self._excluded(f, r):
                     continue
                 b = self.base.get(r)
+                if b and b.get("t") == "g":
+                    continue                                 # shortcut to a Google Doc seen before
                 if not b or self._md5(Path(dirpath) / f, b) != b.get("md5"):
                     return True
         return False
@@ -548,8 +565,12 @@ class TwoWaySyncer(StorageFullMixin):
                         if r not in self.base:
                             return True
                         nxt[item["id"]] = r
+                    elif gdocs.is_native(item):
+                        b = self.base.get(_join(level[item["_parent"]], gdocs.link_name(item))) or {}
+                        if b.get("t") != "g" or b.get("id") != item["id"]:
+                            return True  # a Google Doc never shown on this PC - don't trash it unseen
                     elif "md5Checksum" not in item:
-                        return True  # a Google Doc etc. lives here - don't trash it with the folder
+                        return True
                     elif (self.base.get(r) or {}).get("md5") != item["md5Checksum"]:
                         return True
                 level = nxt
@@ -618,6 +639,99 @@ class TwoWaySyncer(StorageFullMixin):
         else:
             self._forget(rel)
 
+    # -- Google Docs/Sheets/Slides: shortcuts on this PC -----------------------------
+    @staticmethod
+    def _is_link(L, R, B) -> bool:
+        if R is not None:
+            return gdocs.is_native(R)
+        if B is not None:
+            return B.get("t") == "g"
+        return L is not None and gdocs.is_link_name(L.name)
+
+    def _remember_link(self, rel: str, doc_id: str, sig: tuple[int, int] | None) -> None:
+        size, mtime_ns = sig or (-1, -1)
+        self.base[rel] = {"t": "g", "id": doc_id, "size": size, "mtime_ns": mtime_ns}
+
+    def _gdoc(self, L, R, B, rel, path: Path, remote_id: str) -> None:
+        linked = B is not None and B.get("t") == "g"
+        if L is not None and R is not None:
+            sig = _sig(path)
+            same = linked and B.get("id") == R["id"] and (B.get("size"), B.get("mtime_ns")) == tuple(sig or ())
+            if not same and gdocs.read_link(path) != R["id"]:
+                gdocs.write_link(path, R)                      # damaged, or now a different Doc
+                sig = _sig(path)
+            self.stats["unchanged"] += 1
+            self._remember_link(rel, R["id"], sig)
+        elif R is not None:                                    # on Drive only
+            if linked and B.get("id") == R["id"]:
+                if self.can_move:
+                    self.gone_links.append((rel, R))           # trashed at the end, unless it moved
+                    return
+                self.drive.trash(R["id"])                      # shortcut deleted on PC
+                self.stats["trashed"] += 1
+                self._emit("trashed", rel, "Deleted on this PC")
+                self._forget(rel)
+                return
+            gdocs.write_link(path, R)
+            self.stats["downloaded"] += 1
+            self._emit("downloaded", rel, f"Shortcut to a {gdocs.kind_name(path.name)} file - "
+                                          "double-click it to open it in your browser")
+            self._remember_link(rel, R["id"], _sig(path))
+        elif L is not None:                                    # on PC only
+            if linked:
+                self.recycle(str(path))                        # deleted on Drive
+                self.stats["deleted_local"] += 1
+                self._emit("deleted_local", rel, "Deleted on Google Drive")
+                self._forget(rel)
+                return
+            doc_id = gdocs.read_link(path)
+            if doc_id and self.can_move:
+                self.new_links.append((rel, path, remote_id, doc_id))   # moved/renamed here? (see the end)
+            else:
+                log.info("%s is a Google Drive shortcut that isn't linked to a file here - left alone", rel)
+        else:
+            self._forget(rel)
+
+    def _settle_links(self, moved: set[str]) -> None:
+        """Shortcuts renamed or moved on this PC: rename/move their Google Doc on Drive the same way.
+        Docs whose shortcut is really gone are trashed afterwards with the other deleted files."""
+        gone: dict[str, tuple[str, dict | None]] = {R["id"]: (rel, R) for rel, R in self.gone_links}
+        for drel, _R in self.gone_dirs:
+            prefix = drel + "/"
+            for k, b in self.base.items():
+                if k.startswith(prefix) and b.get("t") == "g" and b.get("id"):
+                    gone.setdefault(b["id"], (k, None))
+        new, self.new_links = self.new_links, []
+        for rel, path, parent_id, doc_id in new:
+            old_rel, R = gone.pop(doc_id, (None, None))
+            if old_rel is None:
+                log.info("%s is a Google Drive shortcut that isn't linked to a file here - left alone", rel)
+                continue
+            try:
+                name = gdocs.drive_name(path.name)
+                if R and gdocs.link_name(R) == path.name:
+                    name = R["name"]                           # only moved: keep the exact Drive name
+                self.drive.move(doc_id, name, parent_id)
+                moved.add(doc_id)
+                self._forget(old_rel)
+                self._remember_link(rel, doc_id, _sig(path))
+                self.stats["moved"] += 1
+                how = "Renamed on Drive too" if _parent(old_rel) == _parent(rel) else "Moved on Drive too"
+                self._emit("moved", rel, f"{how} (was {old_rel})")
+            except Exception as e:  # noqa: BLE001
+                self._fail(rel, "Couldn't sync", e)
+        gone_links, self.gone_links = self.gone_links, []
+        for rel, R in gone_links:
+            if R["id"] in moved:
+                continue
+            try:
+                self.drive.trash(R["id"])                      # shortcut deleted on PC
+                self.stats["trashed"] += 1
+                self._emit("trashed", rel, "Deleted on this PC")
+                self._forget(rel)
+            except Exception as e:  # noqa: BLE001
+                self._fail(rel, "Couldn't sync", e)
+
     def _could_be_moved(self, size: int) -> bool:
         """Could a new PC file of this size be a renamed / moved one? Only if a synced file of the same
         size is missing from its place on this PC. Everything else uploads right away (holding back
@@ -671,6 +785,7 @@ class TwoWaySyncer(StorageFullMixin):
                 if self.progress:
                     self.progress.file_done(sig[0])
             self._save_now_and_then()
+        self._settle_links(moved)
         gone_files, self.gone_files = self.gone_files, []
         for rel, R, _B in gone_files:
             if R["id"] in moved:
