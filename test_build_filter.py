@@ -47,5 +47,24 @@ class KeepTests(unittest.TestCase):
         self.assertIn("GNU LESSER GENERAL PUBLIC LICENSE", (root / "LGPL-3.0.txt").read_text(encoding="utf-8"))
 
 
+class VersionInfoTests(unittest.TestCase):
+    """DriveSync.exe carries Windows version details: without them Defender's machine-learning check
+    flagged the one-folder launcher as "Trojan:Win32/Bearfoos.A!ml" and deleted it on install."""
+
+    def test_version_details(self):
+        from version import __version__
+        info = build_filter.version_info(__version__)
+        text = str(info)
+        for key, value in (("ProductName", "Drive Sync"), ("FileVersion", __version__),
+                           ("OriginalFilename", "DriveSync.exe"), ("CompanyName", "Drive Sync")):
+            self.assertIn(f"'{key}', '{value}'", text)
+        nums = tuple(int(x) for x in __version__.split("."))
+        self.assertEqual(info.ffi.fileVersionMS >> 16, nums[0])
+
+    def test_spec_uses_it(self):
+        spec = (Path(__file__).parent / "DriveSync.spec").read_text(encoding="utf-8")
+        self.assertIn("version=version_info(__version__)", spec)
+
+
 if __name__ == "__main__":
     unittest.main()

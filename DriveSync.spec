@@ -9,7 +9,8 @@ import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 sys.path.insert(0, SPECPATH)  # noqa: F821 - set by PyInstaller
-from build_filter import QT_UNUSED, keep  # noqa: E402 - what's left out of the build (tested)
+from build_filter import QT_UNUSED, keep, version_info  # noqa: E402 - what's left out of the build (tested)
+from version import __version__  # noqa: E402
 
 ONEDIR = os.environ.get("DRIVESYNC_ONEDIR") == "1"
 
@@ -35,7 +36,7 @@ a.binaries = [b for b in a.binaries if keep(b[0])]
 a.datas = [d for d in a.datas if keep(d[0])]
 pyz = PYZ(a.pure)
 
-common = dict(name="DriveSync", debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
+common = dict(name="DriveSync", version=version_info(__version__), debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
               console=False, disable_windowed_traceback=False, argv_emulation=False, target_arch=None,
               codesign_identity=None, entitlements_file=None, icon=["assets/drivesync.ico"])
 

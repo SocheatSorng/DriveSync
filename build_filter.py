@@ -33,3 +33,35 @@ def keep(dest: str) -> bool:
     if p.startswith("googleapiclient/discovery_cache/documents/"):
         return p.endswith("/" + GOOGLE_DOC_KEPT)
     return True
+
+
+def version_info(version: str):
+    """Windows version details for DriveSync.exe (Properties → Details): product, company, description
+    and version. A PyInstaller exe has none by default, which antivirus heuristics count against it
+    (Defender flagged the one-folder launcher as "Trojan:Win32/Bearfoos.A!ml")."""
+    from PyInstaller.utils.win32.versioninfo import (
+        FixedFileInfo,
+        StringFileInfo,
+        StringStruct,
+        StringTable,
+        VarFileInfo,
+        VarStruct,
+        VSVersionInfo,
+    )
+    nums = tuple(int(x) for x in (version.split(".") + ["0", "0", "0"])[:4])
+    strings = [
+        StringStruct("CompanyName", "Drive Sync"),
+        StringStruct("FileDescription", "Drive Sync - keeps folders in sync with Google Drive"),
+        StringStruct("FileVersion", version),
+        StringStruct("InternalName", "DriveSync"),
+        StringStruct("LegalCopyright", "Copyright (c) Drive Sync contributors"),
+        StringStruct("OriginalFilename", "DriveSync.exe"),
+        StringStruct("ProductName", "Drive Sync"),
+        StringStruct("ProductVersion", version),
+    ]
+    return VSVersionInfo(
+        ffi=FixedFileInfo(filevers=nums, prodvers=nums, mask=0x3F, flags=0x0, OS=0x40004, fileType=0x1,
+                          subtype=0x0, date=(0, 0)),
+        kids=[StringFileInfo([StringTable("040904B0", strings)]),
+              VarFileInfo([VarStruct("Translation", [1033, 1200])])],
+    )
