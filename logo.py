@@ -1,5 +1,5 @@
 """The Drive Sync logo: a blue folder (this PC) folding into a green cloud (Google Drive),
-joined by a yellow fold: the three colors of Google Drive.
+joined by a glowing yellow fold, with a glossy sheen and a light rim that stands out on a dark taskbar.
 
 The shapes are those of assets/drivesync.svg, drawn here with Pillow so the app needs no SVG renderer.
 In full color it is the app's icon and the tray's "up to date" icon; drawn in one color (with the
@@ -26,14 +26,19 @@ _FOLDER = [("M", (180, 0)), ("C", (92, 0), (30, 56), (30, 145)), ("L", (30, 850)
 _CLOUD = [("M", (78, 1000)), ("L", (650, 220)), ("L", (875, 220)),
           ("C", (1000, 220), (1085, 286), (1100, 420)), ("C", (1147, 472), (1190, 552), (1190, 650)),
           ("C", (1190, 850), (1040, 1000), (820, 1000))]
-_RIM = [("M", (30, 145)), ("C", (30, 56), (92, 0), (180, 0))]
+_GLINT = [("M", (180, 12)), ("C", (104, 12), (43, 64), (42, 145))]  # light on the folder's top-left corner
 _FOLD = ((78, 1000), (650, 220))
-_X0, _X1, _H = 30, 1190, 1000  # the folder's left / right edge and height
+_FOLD_SHADOW = ((92, 982), (650, 220))
+_X0, _X1, _Y0, _Y1 = 22, 1198, -8, 1008  # the shape plus its rim
 
-# Google Drive's blue, green and yellow
-BLUE = ((0, "#2684FC"), (1, "#0066DA"))
-GREEN = ((0, "#00832D"), (1, "#00AC47"))
-YELLOW = "#FFBA00"
+# Each palette: folder (light, dark), cloud (dark, light), fold (edge, middle), rim
+PALETTES = {
+    "vivid": (("#3B9BFF", "#0756D8"), ("#008B43", "#21E68B"), ("#FF9D00", "#FFF36A"), "#A9D9FF"),
+    "jewel": (("#477DFF", "#172D9C"), ("#007B55", "#39F0B0"), ("#FF8A18", "#FFF18A"), "#B9D4FF"),
+    "glass": (("#2EC5FF", "#0755C8"), ("#00A56B", "#5BFFC0"), ("#FFAA22", "#FFF7A0"), "#C4F2FF"),
+    "aurora": (("#397BFF", "#083FAD"), ("#009C65", "#63F56D"), ("#FF7A18", "#FFF04A"), "#AEEAFF"),
+}
+PALETTE = "glass"
 
 
 def _points(path, map_xy) -> list[tuple[float, float]]:
@@ -58,8 +63,19 @@ def _mask(size: int, pts) -> Image.Image:
     return m
 
 
-def _gradient(size: int, box, p0, p1, stops) -> Image.Image:
-    """An SVG-style linear gradient: p0 -> p1 are fractions of box (x0, y0, x1, y1), in pixels."""
+def _line(size: int, pts, width: float, opacity: float = 1) -> Image.Image:
+    """A mask of a line through pts with round ends; its value is the opacity."""
+    m = Image.new("L", (size, size), 0)
+    d = ImageDraw.Draw(m)
+    w = max(1, round(width))
+    d.line(pts, fill=255, width=w, joint="curve")
+    for x, y in (pts[0], pts[-1]):
+        d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=255)
+    return m if opacity == 1 else m.point(lambda v: round(v * opacity))
+
+
+def _ramp(size: int, box, p0, p1) -> Image.Image:
+    """An SVG-style linear gradient's position (0-255) at each pixel: p0 -> p1 are fractions of box."""
     bx, by, bw, bh = box[0], box[1], box[2] - box[0], box[3] - box[1]
     dx, dy = p1[0] - p0[0], p1[1] - p0[1]
     d2 = dx * dx + dy * dy
@@ -68,44 +84,66 @@ def _gradient(size: int, box, p0, p1, stops) -> Image.Image:
     c = 256 - 255 * ((bx / bw + p0[0]) * dx + (by / bh + p0[1]) * dy) / d2
     ramp = Image.new("L", (768, 1))
     ramp.putdata([0] * 256 + list(range(256)) + [255] * 256)
-    t = ramp.transform((size, size), Image.AFFINE, (a, b, c, 0, 0, 0.5), Image.BILINEAR)
-    lut = []
+    return ramp.transform((size, size), Image.AFFINE, (a, b, c, 0, 0, 0.5), Image.BILINEAR)
+
+
+def _lut(stops) -> list[float]:
+    """256 values blended between (offset, value) stops."""
+    out = []
+    for i in range(256):
+        x = i / 255
+        (o0, v0), (o1, v1) = next(((s, e) for s, e in zip(stops, stops[1:]) if x <= e[0]), stops[-2:])
+        f = 0 if o1 == o0 else min(1, max(0, (x - o0) / (o1 - o0)))
+        out.append(v0 + (v1 - v0) * f)
+    return out
+
+
+def _colorize(t: Image.Image, stops) -> Image.Image:
     rgb = [(o, tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))) for o, h in stops]
-    for ch in range(3):
-        for i in range(256):
-            x = i / 255
-            (o0, c0), (o1, c1) = next(((s, e) for s, e in zip(rgb, rgb[1:]) if x <= e[0]), (rgb[-2], rgb[-1]))
-            f = 0 if o1 == o0 else min(1, max(0, (x - o0) / (o1 - o0)))
-            lut.append(round(c0[ch] + (c1[ch] - c0[ch]) * f))
+    lut = [round(v) for ch in range(3) for v in _lut([(o, c[ch]) for o, c in rgb])]
     return t.convert("RGB").point(lut)
 
 
-def draw(size: int, color: str | None = None) -> Image.Image:
+def _paint(img: Image.Image, fill, mask: Image.Image) -> None:
+    """Lay fill (a color or an RGB image) over img where mask is set; mask is the opacity."""
+    layer = Image.new("RGBA", img.size, fill) if isinstance(fill, str) else fill.convert("RGBA")
+    layer.putalpha(mask)
+    img.alpha_composite(layer)
+
+
+def draw(size: int, color: str | None = None, palette: str | None = None) -> Image.Image:
     """The logo as a size x size transparent RGBA image: in full color, or all in one color."""
     big = size * SS
     k = big / (_X1 - _X0)                       # fills the width; centred top to bottom
-    oy = (big - _H * k) / 2
+    oy = (big - (_Y1 - _Y0) * k) / 2 - _Y0 * k
 
     def xy(x, y):
         return ((x - _X0) * k, oy + y * k)
 
-    folder = _mask(big, _points(_FOLDER, xy))
-    fold = Image.new("L", (big, big), 0)
+    outline = _points(_FOLDER, xy)
+    folder = _mask(big, outline)
+    fold = [xy(*p) for p in _FOLD]
     if color:
         img = Image.new("RGBA", (big, big), color)
-        ImageDraw.Draw(fold).line([xy(*p) for p in _FOLD], fill=255, width=max(SS, round(40 * k)))
-        img.putalpha(ImageChops.subtract(folder, fold))
-    else:
-        img = _gradient(big, (*xy(0, 0), *xy(1200, 1000)), (0, 0), (0.9, 1), BLUE).convert("RGBA")
-        cloud = ImageChops.multiply(_mask(big, _points(_CLOUD, xy)), folder)
-        img.paste(_gradient(big, (*xy(78, 220), *xy(1190, 1000)), (0.05, 0.95), (0.95, 0.05), GREEN), mask=cloud)
-        d = ImageDraw.Draw(img)
-        line = [xy(*p) for p in _FOLD]
-        d.line(line, fill=YELLOW, width=max(SS, round(56 * k)))
-        rim = Image.new("RGBA", (big, big), (0, 0, 0, 0))
-        ImageDraw.Draw(rim).line(_points(_RIM, xy), fill=(140, 190, 255, 122), width=max(1, round(8 * k)))
-        img.alpha_composite(rim)
-        img.putalpha(folder)
+        img.putalpha(ImageChops.subtract(folder, _line(big, fold, max(SS, 40 * k))))
+        return img.resize((size, size), Image.LANCZOS)
+
+    blue, green, gold, rim = PALETTES[palette or PALETTE]
+    whole = (*xy(0, 0), *xy(1200, 1000))
+    shine = _ramp(big, whole, (0, 0), (0.8, 1)).point([round(255 * v) for v in _lut([(0, .36), (.5, .05), (1, 0)])])
+    img = _colorize(_ramp(big, whole, (0, 0), (0.9, 1)), ((0, blue[0]), (1, blue[1]))).convert("RGBA")
+    _paint(img, "#FFFFFF", shine)
+    cloud = ImageChops.multiply(_mask(big, _points(_CLOUD, xy)), folder)
+    _paint(img, _colorize(_ramp(big, (*xy(78, 220), *xy(1190, 1000)), (0.05, 0.95), (0.95, 0.05)),
+                          ((0, green[0]), (1, green[1]))), cloud)
+    _paint(img, "#FFFFFF", ImageChops.multiply(cloud, shine.point(lambda v: round(v * .85))))
+    _paint(img, "#003D65", _line(big, [xy(*p) for p in _FOLD_SHADOW], 76 * k, .28))
+    _paint(img, _colorize(_ramp(big, (*xy(78, 220), *xy(650, 1000)), (0, 1), (1, 0)),
+                          ((0, gold[0]), (.48, gold[1]), (1, gold[0]))), _line(big, fold, max(SS, 48 * k)))
+    _paint(img, "#FFF9D5", _line(big, fold, 7 * k, .72))
+    _paint(img, rim, _line(big, _points(_GLINT, xy), 13 * k))
+    img.putalpha(folder)
+    _paint(img, rim, _line(big, outline + outline[:1], 15 * k))
     return img.resize((size, size), Image.LANCZOS)
 
 
