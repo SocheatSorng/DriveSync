@@ -1,4 +1,5 @@
-"""The Drive Sync logo: a navy folder (this PC) folding into a coral cloud (Google Drive).
+"""The Drive Sync logo: a blue folder (this PC) folding into a green cloud (Google Drive),
+joined by a yellow fold: the three colors of Google Drive.
 
 The shapes are those of assets/drivesync.svg, drawn here with Pillow so the app needs no SVG renderer.
 In full color it is the app's icon and the tray's "up to date" icon; drawn in one color (with the
@@ -29,8 +30,10 @@ _RIM = [("M", (30, 145)), ("C", (30, 56), (92, 0), (180, 0))]
 _FOLD = ((78, 1000), (650, 220))
 _X0, _X1, _H = 30, 1190, 1000  # the folder's left / right edge and height
 
-NAVY = ((0, "#2B3FA0"), (1, "#1E2A78"))
-CORAL = ((0, "#FF493F"), (0.55, "#FF6657"), (1, "#FFB15F"))
+# Google Drive's blue, green and yellow
+BLUE = ((0, "#2684FC"), (1, "#0066DA"))
+GREEN = ((0, "#00832D"), (1, "#00AC47"))
+YELLOW = "#FFBA00"
 
 
 def _points(path, map_xy) -> list[tuple[float, float]]:
@@ -93,15 +96,14 @@ def draw(size: int, color: str | None = None) -> Image.Image:
         ImageDraw.Draw(fold).line([xy(*p) for p in _FOLD], fill=255, width=max(SS, round(40 * k)))
         img.putalpha(ImageChops.subtract(folder, fold))
     else:
-        img = _gradient(big, (*xy(0, 0), *xy(1200, 1000)), (0, 0), (0.9, 1), NAVY).convert("RGBA")
+        img = _gradient(big, (*xy(0, 0), *xy(1200, 1000)), (0, 0), (0.9, 1), BLUE).convert("RGBA")
         cloud = ImageChops.multiply(_mask(big, _points(_CLOUD, xy)), folder)
-        img.paste(_gradient(big, (*xy(78, 220), *xy(1190, 1000)), (0.05, 0.95), (0.95, 0.05), CORAL), mask=cloud)
+        img.paste(_gradient(big, (*xy(78, 220), *xy(1190, 1000)), (0.05, 0.95), (0.95, 0.05), GREEN), mask=cloud)
         d = ImageDraw.Draw(img)
         line = [xy(*p) for p in _FOLD]
-        d.line(line, fill="#FFD16D", width=max(SS // 2, round(17 * k)))
-        d.line(line, fill="#FFF0B0", width=max(1, round(4 * k)))
+        d.line(line, fill=YELLOW, width=max(SS, round(56 * k)))
         rim = Image.new("RGBA", (big, big), (0, 0, 0, 0))
-        ImageDraw.Draw(rim).line(_points(_RIM, xy), fill=(138, 155, 255, 122), width=max(1, round(8 * k)))
+        ImageDraw.Draw(rim).line(_points(_RIM, xy), fill=(140, 190, 255, 122), width=max(1, round(8 * k)))
         img.alpha_composite(rim)
         img.putalpha(folder)
     return img.resize((size, size), Image.LANCZOS)

@@ -92,7 +92,7 @@ def make_icon(color: str | None = None) -> Image.Image:
 
 
 ICONS = {
-    "idle": make_icon(),              # navy + coral - up to date
+    "idle": make_icon(),              # full color  - up to date
     "syncing": make_icon("#ffb020"),  # amber  - working
     "error": make_icon("#ff4d4f"),    # red    - needs attention
     "paused": logo.draw_paused(tray_icon_size()),  # grey + pause badge - paused
