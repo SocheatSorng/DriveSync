@@ -7,12 +7,12 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from urllib.parse import urlencode
 
 import customtkinter as ctk
 
 import browsers
 import smooth_scroll
+import ui_model
 import updater
 from activity_view import ActivityView
 from skip_picker import split_patterns
@@ -28,17 +28,16 @@ SURFACE = ("#ffffff", "#333333")        # a card that sits straight on a tab (CA
 BAR_TRACK = ("#e3e3e3", "#3c4043")      # the empty part of a progress bar
 ERROR_TEXT = ("#d93025", "#f28b82")
 WAITING_TEXT = ("#b06000", "#fdd663")   # a new folder waiting for "Start syncing"
+LINK = ("#1a73e8", "#8ab4f8")
+# ui_model's tones -> this window's colours (None: the default text colour)
+TONES = {"error": ERROR_TEXT, "waiting": WAITING_TEXT, "muted": MUTED, "link": LINK, None: None}
+ACCOUNT_TONES = {"ok": "#1e8e3e", "error": "#d93025", "muted": MUTED}
 SECONDARY = {"fg_color": "transparent", "border_width": 1, "text_color": ("#1f1f1f", "#e3e3e3"),
              "border_color": ("#c4c7c5", "#5f6368"), "hover_color": ("#e8eaed", "#3c4043")}
 DANGER = {"fg_color": "transparent", "text_color": ("#d93025", "#f28b82"),
           "hover_color": ("#fce8e6", "#3c2a2a")}
-MODES = {"Two-way": "two_way", "Upload only (backup)": "upload"}
-LIMITS = {"No limit": 0, "256 KB/s": 256, "512 KB/s": 512, "1 MB/s": 1024, "2 MB/s": 2048,
-          "5 MB/s": 5120, "10 MB/s": 10240}
-POLLS = {"Every 5 seconds": 5, "Every 10 seconds": 10, "Every 30 seconds": 30, "Every minute": 60}
-INTERVALS = {"Every 5 minutes": 5, "Every 15 minutes": 15, "Every 30 minutes": 30, "Every hour": 60,
-             "Every 3 hours": 180, "Every 6 hours": 360, "Once a day": 1440}
-
+MODES = ui_model.MODES
+LIMITS, POLLS, INTERVALS = ui_model.LIMITS, ui_model.POLLS, ui_model.INTERVALS   # (shared with the Qt window)
 
 def autowrap(label, container, margin=0) -> None:
     """Wrap a label's text to its container's current width (instead of a fixed width that gets cut off).
@@ -100,10 +99,7 @@ class Tooltip:
 
 
 # --------------------------------------------------------------------------- #
-def _strip_my_drive(path: str) -> str:
-    """'My Drive/School/2026' -> 'School/2026' (typed paths are always inside My Drive)."""
-    path = path.strip().replace("\\", "/").strip("/")
-    return path[len("My Drive"):].lstrip("/") if path.lower().startswith("my drive") else path
+_strip_my_drive = ui_model.strip_my_drive   # (old name, still used by the dialogs below and tests)
 
 
 class FolderDialog(ctk.CTkToplevel):
@@ -127,10 +123,7 @@ class FolderDialog(ctk.CTkToplevel):
         # A folder chosen in the Drive browser is stored by ID (+ its path, for display).
         self.drive_id: str | None = self.data.get("drive_folder_id")
         self.chosen_label: str | None = self.data.get("drive_folder") if self.drive_id else None
-        shown = self.data.get("drive_folder", "")
-        if shown and not self.drive_id:
-            shown = f"My Drive/{_strip_my_drive(shown)}"
-        self.drive = tk.StringVar(value=shown)
+        self.drive = tk.StringVar(value=ui_model.drive_text_for(self.data))
         self.delete = tk.BooleanVar(value=bool(self.data.get("delete")))
         self.exclude = tk.StringVar(value=", ".join(self.data.get("exclude", [])))
         self.exclude_where: dict[str, str] = dict(self.data.get("exclude_where", {}))  # pattern -> pc/drive/both
@@ -213,15 +206,12 @@ class FolderDialog(ctk.CTkToplevel):
             pass
 
     def _show_mode(self):
-        if MODES[self.mode.get()] == "two_way":
-            self.mode_help.configure(text="Changes on either side are copied to the other: new, edited and deleted "
-                                          "files. Deleted files go to the Windows Recycle Bin or the Drive trash. "
-                                          "If a file is edited on both sides, both versions are kept.")
+        mode = MODES[self.mode.get()]
+        self.mode_help.configure(text=ui_model.mode_help(mode))
+        if mode == "two_way":
             self.delete_box.grid_remove()
             self.delete_help.grid_remove()
         else:
-            self.mode_help.configure(text="This PC is the master copy: files are only uploaded. Changes made on "
-                                          "Drive never touch this PC.")
             self.delete_box.grid(row=13, column=0, columnspan=2, sticky="w", pady=(12, 0))
             self.delete_help.grid(row=14, column=0, columnspan=2, sticky="w")
 
@@ -238,7 +228,7 @@ class FolderDialog(ctk.CTkToplevel):
             path = os.path.normpath(path)
             self.local.set(path)
             if not self.drive.get():
-                self.drive.set(f"My Drive/PC Backup/{Path(path).name}")
+                self.drive.set(ui_model.default_drive_text(path))
 
     def choose_skips(self):
         from drive_sync import DEFAULT_EXCLUDES
@@ -264,7 +254,7 @@ class FolderDialog(ctk.CTkToplevel):
     def choose_drive_folder(self):
         email = self.account.get()
         if not email:
-            messagebox.showinfo("Drive Sync", "Add a Google account in Settings first.", parent=self)
+            messagebox.showinfo("Drive Sync", ui_model.NEED_ACCOUNT, parent=self)
             return
         picked = DriveFolderBrowser(self, self.app, email).result
         if picked:
@@ -273,30 +263,13 @@ class FolderDialog(ctk.CTkToplevel):
         self._grab()
 
     def ok(self):
-        local = self.local.get().strip()
-        if not os.path.isdir(local):
-            messagebox.showerror("Drive Sync", "Please choose a folder that exists on this PC.", parent=self)
+        result = ui_model.folder_result(
+            self.data, local=self.local.get(), account=self.account.get() or None, mode=MODES[self.mode.get()],
+            delete=self.delete.get(), exclude_text=self.exclude.get(), exclude_where=self.exclude_where,
+            drive_text=self.drive.get(), drive_id=self.drive_id, chosen_label=self.chosen_label)
+        if result is None:
+            messagebox.showerror("Drive Sync", ui_model.NEED_PC_FOLDER, parent=self)
             return
-        local = os.path.normpath(local)
-        text = self.drive.get().strip()
-        account = self.account.get() or None
-        mode = MODES[self.mode.get()]
-        result = {**self.data, "local": local, "account": account, "mode": mode,
-                  "delete": self.delete.get() if mode == "upload" else False,
-                  "exclude": split_patterns(self.exclude.get())}
-        where = {p: w for p, w in self.exclude_where.items() if p in result["exclude"]}
-        if where:
-            result["exclude_where"] = where
-        else:
-            result.pop("exclude_where", None)
-        result.pop("drive_folder_id", None)
-        if self.drive_id and text == self.chosen_label:
-            result["drive_folder_id"] = self.drive_id
-            result["drive_folder"] = self.chosen_label
-        else:
-            result["drive_folder"] = _strip_my_drive(text) or f"PC Backup/{Path(local).name}"
-        if account is None:
-            result.pop("account")
         self.result = result
         self.destroy()
 
@@ -491,7 +464,7 @@ class AddAccountDialog(ctk.CTkToplevel):
 
     def __init__(self, parent, app, choices: dict[str, str | None]):
         super().__init__(parent)
-        self.title("Add Google account")
+        self.title(ui_model.ADD_ACCOUNT_TITLE)
         self.resizable(False, False)
         self.transient(parent)
         self.after(250, lambda: app.apply_window_icon(self))
@@ -502,14 +475,13 @@ class AddAccountDialog(ctk.CTkToplevel):
         f = ctk.CTkFrame(self, fg_color="transparent")
         f.pack(padx=24, pady=20, fill="both")
         ctk.CTkLabel(f, text="Sign in with", font=font(13, "bold"), anchor="w").pack(anchor="w")
-        ctk.CTkLabel(f, text="Pick the browser profile that's signed in to (or should hold) this Google account. "
-                             "Drive Sync remembers it and opens this account's Drive links there too.",
+        ctk.CTkLabel(f, text=ui_model.ADD_ACCOUNT_TEXT,
                      font=font(12), text_color=MUTED, justify="left", wraplength=420, anchor="w").pack(
             anchor="w", pady=(2, 10))
         self.menu = ctk.CTkOptionMenu(f, values=list(choices), width=420, dynamic_resizing=False)
         self.menu.set(next(iter(choices)))
         self.menu.pack(anchor="w")
-        ctk.CTkLabel(f, text="On Google's page, choose the account - or “Use another account”.",
+        ctk.CTkLabel(f, text=ui_model.ADD_ACCOUNT_HINT,
                      font=font(12), text_color=MUTED, anchor="w").pack(anchor="w", pady=(10, 0))
 
         btns = ctk.CTkFrame(f, fg_color="transparent")
@@ -613,7 +585,7 @@ class MainWindow:
     def _build_folders(self, tab):
         top = ctk.CTkFrame(tab, fg_color="transparent")
         top.pack(fill="x", padx=8, pady=(4, 8))
-        ctk.CTkLabel(top, text="Folders backed up to Google Drive", font=font(14, "bold")).pack(side="left")
+        ctk.CTkLabel(top, text=ui_model.FOLDERS_HEADING, font=font(14, "bold")).pack(side="left")
         self.add_btn = ctk.CTkButton(top, text="+  Add folder", width=120, command=self.add_folder)
         self.add_btn.pack(side="right")
         self.drive_btn = ctk.CTkButton(top, text="Open Google Drive", width=140, command=lambda: self.open_drive(None),
@@ -766,102 +738,45 @@ class MainWindow:
 
     # ------------------------------------------------------------ refreshers
     def refresh_state(self):
-        app = self.app
-        color = STATE_COLORS["paused" if app.paused else app.state]
-        self.dot.configure(text_color=color)
-        self.status_lbl.configure(text=app.status)
-        files = app.file_lines if app.state == "syncing" else []
-        self.detail_lbl.configure(text="\n".join([app.detail, *files]))  # one line per file at once
-        self.pause_btn.configure(text="Resume" if app.paused else "Pause")
-        self.sync_btn.configure(state="disabled" if app.state == "syncing" else "normal")
-        prog = app.progress
-        if app.state == "syncing" and prog is not None and prog.total:
+        h = ui_model.header(self.app)
+        self.dot.configure(text_color=STATE_COLORS[h.dot])
+        self.status_lbl.configure(text=h.status)
+        self.detail_lbl.configure(text=h.detail)  # one line per file at once
+        self.pause_btn.configure(text=h.pause_text)
+        self.sync_btn.configure(state="normal" if h.sync_enabled else "disabled")
+        if h.progress is not None:
             self.bar.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
-            self.bar.set(prog.percent / 100)
+            self.bar.set(h.progress)
         else:
             self.bar.grid_remove()
 
     def refresh_update(self):
         app = self.app
-        where = "installed" if updater.installed_copy() else "not installed with Setup: updates are only shown"
-        status = f"\n{app.update_status}" if app.update_status else ""
-        self.update_lbl.configure(text=f"Version {__version__} ({where}){status}")
-        if app.update and updater.installed_copy():
-            self.update_btn.configure(text=f"Update to {app.update.version}")
-            self.update_btn.pack(side="left", padx=(8, 0))
-        elif app.update:
-            self.update_btn.configure(text="Download page")
+        text, button = ui_model.update_line(__version__, updater.installed_copy(), app.update_status, app.update)
+        self.update_lbl.configure(text=text)
+        if button:
+            self.update_btn.configure(text=button)
             self.update_btn.pack(side="left", padx=(8, 0))
         else:
             self.update_btn.pack_forget()
 
-    SKIP_CHARS = 70     # chips shown on a folder card before "+N more"
     CHIP = {"fg_color": ("#e3e3e3", "#3c4043"), "corner_radius": 8, "height": 22}
-
-    # Where a skipped item is: (badge on its chip, text colour, what skipping it means).
-    SKIP_SIDES = {
-        "pc": ("This PC", None, "On this PC only - it isn't uploaded to Google Drive."),
-        "drive": ("Google Drive", ("#1a73e8", "#8ab4f8"),
-                  "On Google Drive only - it isn't downloaded to this PC."),
-        "both": ("PC + Drive", None, "On this PC and on Google Drive - both copies are left as they are "
-                                     "and no longer kept the same."),
-        "rule": ("Rule", MUTED, "A rule: anything matching it, anywhere in the folder, on this PC or "
-                                "Google Drive, isn't synced."),
-    }
-
-    @staticmethod
-    def skip_side(pattern: str, local: str, where: dict) -> str | None:
-        """Where a skipped item is: "pc", "drive", "both", "rule", or None (not known)."""
-        from skip_picker import COMMON, describe, is_rule
-        if is_rule(pattern) or pattern in {p for p, _ in COMMON}:
-            return "rule"                          # *.log, or a common name like node_modules: anywhere
-        full = describe(pattern)[1]
-        on_pc = os.path.lexists(os.path.join(local, *full.split("/")))
-        saved = where.get(pattern)                 # seen when it was ticked in the picker
-        if saved is None:   # saved before sides were recorded: a picked path not on this PC came from Drive
-            return "pc" if on_pc else "drive"
-        on_drive = saved in ("drive", "both")
-        return "both" if on_pc and on_drive else "drive" if on_drive else "pc" if on_pc else saved
+    skip_side = staticmethod(ui_model.skip_side)   # (old place; the logic is in ui_model)
 
     def _skip_row(self, parent, skips: list[str], local: str, on_click, where: dict | None = None):
         """'Skips  [Big folder · Google Drive] [*.log · Rule] [+3 more]': short names and which side
-        each is on, the full list on hover; click to edit."""
-        from skip_picker import describe
-        where = where or {}
+        each is on, the full list on hover; click to edit (texts from ui_model.skip_chips)."""
+        model = ui_model.skip_chips(skips, local, where)
         row = ctk.CTkFrame(parent, fg_color="transparent")
         ctk.CTkLabel(row, text="Skips", font=font(12), text_color=MUTED).pack(side="left", padx=(0, 6))
-        shown, used = [], 0
-        for p in skips:
-            short, _ = describe(p)
-            if len(short) > 28:
-                short = short[:27] + "…"
-            side = self.skip_side(p, local, where)
-            badge = self.SKIP_SIDES[side][0] if side else ""
-            if shown and used + len(short) + len(badge) > self.SKIP_CHARS:
-                break
-            shown.append((p, short, side))
-            used += len(short) + len(badge) + 6
         chips = []
-        for p, short, side in shown:
-            full = describe(p)[1]
-            badge, color, meaning = self.SKIP_SIDES[side] if side else ("", None, "Not synced either way.")
-            text = f"{short}  ·  {badge}" if badge else short
-            chip = ctk.CTkLabel(row, text=text, font=font(12), **self.CHIP,
-                                **({"text_color": color} if color else {}))
-            chip.pack(side="left", padx=(0, 4), ipadx=6)
-            Tooltip(chip, f"{full}\n{meaning}\n\nClick to change what's skipped.")
-            chips.append(chip)
-        rest = skips[len(shown):]
-        if rest:
-            more = ctk.CTkLabel(row, text=f"+{len(rest)} more", font=font(12), text_color=("#1a73e8", "#8ab4f8"),
-                                **self.CHIP)
-            more.pack(side="left", ipadx=6)
-            lines = []
-            for p in rest:
-                side = self.skip_side(p, local, where)
-                lines.append(describe(p)[1] + (f"   ({self.SKIP_SIDES[side][0]})" if side else ""))
-            Tooltip(more, "\n".join(lines) + "\n\nClick to change what's skipped.")
-            chips.append(more)
+        for chip in [*model.shown, *([model.more] if model.more else [])]:
+            color = TONES[chip.tone]
+            w = ctk.CTkLabel(row, text=chip.text, font=font(12), **self.CHIP,
+                             **({"text_color": color} if color else {}))
+            w.pack(side="left", padx=(0, 4), ipadx=6)
+            Tooltip(w, chip.tooltip)
+            chips.append(w)
         for w in chips:
             w.configure(cursor="hand2")
             w.bind("<Button-1>", lambda _e: on_click())
@@ -875,8 +790,8 @@ class MainWindow:
             self.add_btn.pack_forget()    # the empty card has the one Add folder button
             box = ctk.CTkFrame(self.folder_list, fg_color=SURFACE, corner_radius=10)
             box.pack(fill="x", padx=(0, 8), pady=(24, 0))
-            ctk.CTkLabel(box, text="Back up your first folder", font=font(14, "bold")).pack(padx=24, pady=(32, 4))
-            hint = ctk.CTkLabel(box, text="Choose a folder on this PC and Drive Sync will keep a copy in Google Drive.",
+            ctk.CTkLabel(box, text=ui_model.EMPTY_FOLDERS_TITLE, font=font(14, "bold")).pack(padx=24, pady=(32, 4))
+            hint = ctk.CTkLabel(box, text=ui_model.EMPTY_FOLDERS_TEXT,
                                 font=font(12), text_color=MUTED, justify="center")
             hint.pack(padx=24)
             autowrap(hint, box, margin=48)
@@ -892,43 +807,18 @@ class MainWindow:
             c.pack(fill="x", padx=(0, 8), pady=(0, 8))
             c.columnconfigure(0, weight=1)
             local = f.get("local", "")
-            # The folder's name as the title, the folder it's in underneath ("D:\" is shown whole).
-            name = os.path.basename(local.rstrip("\\/")) or local
-            parent = os.path.dirname(local.rstrip("\\/")) if name != local else ""
-            title = ctk.CTkLabel(c, text=name, font=font(14, "bold"), anchor="w", justify="left")
-            title.grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(12, 0))
-            where = ctk.CTkLabel(c, text=parent, font=font(12), text_color=MUTED, anchor="w", justify="left",
-                                 height=16)
-            if parent:
-                where.grid(row=1, column=0, columnspan=2, sticky="w", padx=16)
-            if f.get("drive_folder_id"):   # chosen in the Drive browser: already a full path
-                target = f.get("drive_folder") or f"folder id {f['drive_folder_id']}"
-            else:                          # typed path: always inside My Drive
-                target = f"My Drive/{_strip_my_drive(f.get('drive_folder', ''))}"
-            if f.get("mode", "two_way") == "two_way":
-                extra = " · two-way"
-            else:
-                extra = " · upload only" + (", Drive matches PC" if f.get("delete") else "")
             exists = os.path.isdir(local)
             email = self.app.folder_account(f, known)
-            waiting = self.app.is_waiting(f)
-            if not exists:
-                line, color = "⚠  This folder no longer exists on this PC", ERROR_TEXT
-            elif not email:
-                line, color = "⚠  No Google account - add one in Settings", ERROR_TEXT
-            elif email not in known:
-                line, color = f"⚠  Account {email} was removed - click Edit to choose another", ERROR_TEXT
-            elif email in signin:
-                line, color = f"⚠  {email} needs to sign in again (Settings → Google accounts)", ERROR_TEXT
-            elif waiting:
-                arrow = "↔" if f.get("mode", "two_way") == "two_way" else "→"
-                line, color = (f"Waiting - press Start syncing   ·   {arrow}  {email} · {target}{extra}",
-                               WAITING_TEXT)
-            else:
-                arrow = "↔" if f.get("mode", "two_way") == "two_way" else "→"  # (⇄ isn't in Segoe UI)
-                line, color = f"{arrow}  {email} · {target}{extra}", MUTED
-            info = ctk.CTkLabel(c, text=line, font=font(12), text_color=color, anchor="w", justify="left",
-                                height=16)
+            card = ui_model.folder_card(f, email, known, signin, self.app.is_waiting(f), exists)
+            # The folder's name as the title, the folder it's in underneath ("D:\" is shown whole).
+            title = ctk.CTkLabel(c, text=card.title, font=font(14, "bold"), anchor="w", justify="left")
+            title.grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(12, 0))
+            where = ctk.CTkLabel(c, text=card.location, font=font(12), text_color=MUTED, anchor="w",
+                                 justify="left", height=16)
+            if card.location:
+                where.grid(row=1, column=0, columnspan=2, sticky="w", padx=16)
+            info = ctk.CTkLabel(c, text=card.line, font=font(12), text_color=TONES[card.tone], anchor="w",
+                                justify="left", height=16)
             # Full card width under the buttons, wrapping to the window's width.
             skips = f.get("exclude") or []
             info.grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 8 if skips else 12))
@@ -941,9 +831,9 @@ class MainWindow:
             autowrap(where, c, margin=40)
             autowrap(info, c, margin=40)
             autowrap(title, c, margin=lambda b=btns: b.winfo_width() + 48)  # beside the buttons
-            if waiting:   # one time only: the folder's first sync runs when this is pressed
+            if card.waiting:   # one time only: the folder's first sync runs when this is pressed
                 ctk.CTkButton(btns, text="Start syncing", width=110, height=28, font=font(13, "bold"),
-                              state="normal" if exists and email in known and email not in signin else "disabled",
+                              state="normal" if card.can_start else "disabled",
                               command=lambda f=f: self.start_folder(f)).pack(side="left", padx=(8, 0))
             for text, cmd, style in (("Open", lambda i=i: self.open_local(i), SECONDARY),
                                      ("Drive", lambda i=i: self.open_drive(i), SECONDARY),
@@ -957,21 +847,9 @@ class MainWindow:
         ready = self.app.credentials_ready()
         info = self.app.accounts_info()
         busy = self.app.signing_in
-        if not ready:
-            text = ("First, import the OAuth client file (credentials.json) from Google Cloud Console. "
-                    "The setup guide explains each step.")
-        elif busy:
-            text = ("Waiting for you in the browser… choose the Google account and allow access. "
-                    "(This window updates by itself when you're done. Closed the browser? Press Cancel.)")
-        elif not info:
-            text = ("Add the Google account to back up to. Your browser opens so you can choose which "
-                    "account - you can add more than one and pick one per folder.")
-        else:
-            text = ("Each folder syncs to the account chosen for it (Folders → Edit). "
-                    "Drive Sync can only see files it created.")
-        self.account_lbl.configure(text=text)
-        self.add_account_btn.configure(state="normal" if ready and not busy else "disabled",
-                                       text="Waiting for browser…" if busy else "+  Add Google account")
+        self.account_lbl.configure(text=ui_model.accounts_help(ready, busy, bool(info)))
+        enabled, label = ui_model.add_account_button(ready, busy)
+        self.add_account_btn.configure(state="normal" if enabled else "disabled", text=label)
         if busy:
             self.cancel_signin_btn.pack(side="left", padx=(8, 0), after=self.add_account_btn)
         else:
@@ -984,22 +862,17 @@ class MainWindow:
             r = ctk.CTkFrame(self.accounts_box, fg_color=("#ffffff", "#333333"), corner_radius=8)
             r.pack(fill="x", padx=4, pady=(0, 6))
             r.columnconfigure(1, weight=1)
-            ctk.CTkLabel(r, text="●", font=font(16), width=20,
-                         text_color="#d93025" if a["needs_signin"] else "#1e8e3e").grid(
+            row = ui_model.account_row(a)
+            ctk.CTkLabel(r, text="●", font=font(16), width=20, text_color=ACCOUNT_TONES[row.dot]).grid(
                 row=0, column=0, rowspan=2, padx=(10, 6), pady=8)
-            ctk.CTkLabel(r, text=a["email"], font=font(13, "bold"), anchor="w").grid(
+            ctk.CTkLabel(r, text=row.email, font=font(13, "bold"), anchor="w").grid(
                 row=0, column=1, sticky="w", pady=(8, 0))
             n = a["folders"]
-            status = "Click “Sign in again” to keep syncing (needs updated access)" if a["needs_signin"] else (
-                f"{n} folder{'s' if n != 1 else ''}" if n else "No folders yet")
-            if a.get("storage") and not a["needs_signin"]:
-                status += f"  ·  Drive: {a['storage']}" + ("  -  nearly full" if a.get("nearly_full") else "")
-            ctk.CTkLabel(r, text=status, font=font(12), anchor="w",
-                         text_color="#d93025" if a["needs_signin"] or a.get("nearly_full") else MUTED).grid(
+            ctk.CTkLabel(r, text=row.status, font=font(12), anchor="w", text_color=ACCOUNT_TONES[row.tone]).grid(
                 row=1, column=1, sticky="w", pady=(0, 8))
             pr = ctk.CTkFrame(r, fg_color="transparent")
             pr.grid(row=2, column=1, columnspan=2, sticky="w", pady=(0, 10))
-            ctk.CTkLabel(pr, text="Open Drive links and sign-in in:", font=font(12), text_color=MUTED).pack(
+            ctk.CTkLabel(pr, text=ui_model.PROFILE_LABEL, font=font(12), text_color=MUTED).pack(
                 side="left", padx=(0, 8))
             labels = list(profile_labels)
             current = self._label_for(self.app.account_profile(a["email"]), profile_labels)
@@ -1012,7 +885,7 @@ class MainWindow:
             menu.pack(side="left")
             b = ctk.CTkFrame(r, fg_color="transparent")
             b.grid(row=0, column=2, rowspan=2, padx=8)
-            if a["needs_signin"]:
+            if row.needs_signin:
                 ctk.CTkButton(b, text="Sign in again", width=110, height=28,
                               state="normal" if ready and not busy else "disabled",
                               command=lambda e=a["email"]: self.app.add_account(e)).pack(side="left", padx=(6, 0))
@@ -1025,18 +898,12 @@ class MainWindow:
     def add_folder(self):
         d = FolderDialog(self.root, self.app, "Add folder")
         if d.result:
-            cfg = dict(self.app.cfg)
             known = [a["email"] for a in self.app.accounts_info()]
-
-            def key(f):
-                return os.path.normcase(f["local"]), self.app.folder_account(f, known)
-
-            if any(key(f) == key(d.result) for f in cfg["folders"]):
-                messagebox.showinfo("Drive Sync", "That folder is already being synced to this account.",
-                                    parent=self.root)
-                return
             # A new folder waits: its first sync runs when "Start syncing" on its card is pressed.
-            cfg["folders"] = [*cfg["folders"], {**d.result, "waiting": True}]
+            cfg = ui_model.add_folder(self.app.cfg, d.result, known, self.app.folder_account)
+            if cfg is None:
+                messagebox.showinfo("Drive Sync", ui_model.DUPLICATE_FOLDER, parent=self.root)
+                return
             self.app.save_config(cfg)
             self.refresh_folders()
 
@@ -1048,18 +915,14 @@ class MainWindow:
         cfg = dict(self.app.cfg)
         d = FolderDialog(self.root, self.app, "Edit folder", cfg["folders"][i])
         if d.result:
-            cfg["folders"] = list(cfg["folders"])
-            cfg["folders"][i] = d.result
-            self.app.save_config(cfg)
+            self.app.save_config(ui_model.replace_folder(cfg, i, d.result))
             self.refresh_folders()
 
     def remove_folder(self, i: int):
         cfg = dict(self.app.cfg)
         f = cfg["folders"][i]
-        if messagebox.askyesno("Drive Sync", f"Stop syncing this folder?\n\n{f['local']}\n\n"
-                               "Files already on Google Drive are not deleted.", parent=self.root):
-            cfg["folders"] = [x for j, x in enumerate(cfg["folders"]) if j != i]
-            self.app.save_config(cfg)
+        if messagebox.askyesno("Drive Sync", ui_model.remove_folder_question(f), parent=self.root):
+            self.app.save_config(ui_model.without_folder(cfg, i))
             self.refresh_folders()
 
     def open_local(self, i: int):
@@ -1068,46 +931,27 @@ class MainWindow:
             os.startfile(path)  # opens the user's own folder in Explorer
 
     def open_drive(self, i: int | None):
-        rid, email = None, None
         known = [a["email"] for a in self.app.accounts_info()]
-        if i is not None:
-            f = self.app.cfg["folders"][i]
-            email = self.app.folder_account(f, known)
-            rid = f.get("drive_folder_id") or self.app.remote_ids.get((os.path.normcase(f["local"]), email))
-        elif len(known) == 1:
-            email = known[0]
-        url = f"https://drive.google.com/drive/folders/{rid}" if rid else "https://drive.google.com/drive/my-drive"
-        if email:
-            url += "?" + urlencode({"authuser": email})  # the right account inside the profile
-        self.app.open_url(url, email)                     # the right browser profile
+        f = self.app.cfg["folders"][i] if i is not None else None
+        email = self.app.folder_account(f, known) if f is not None else None
+        url = ui_model.drive_url(f, email, known, self.app.remote_ids)   # the right account inside the profile
+        self.app.open_url(url, ui_model.drive_url_email(email, known))  # the right browser profile
 
     # ------------------------------------------------------- browser profiles
-    DEFAULT_BROWSER = "Default browser"
+    DEFAULT_BROWSER = ui_model.DEFAULT_BROWSER
 
     def profile_choices(self) -> dict[str, str | None]:
         """{label shown in menus: profile id}; the first entry is the default browser."""
-        choices: dict[str, str | None] = {self.DEFAULT_BROWSER: None}
-        for p in browsers.list_profiles():
-            label = p.label if p.label not in choices else f"{p.label} ({p.directory})"
-            choices[label] = p.id
-        return choices
+        return ui_model.profile_choices(browsers.list_profiles())
 
     def _label_for(self, profile_id: str | None, choices: dict[str, str | None]) -> str:
-        if not profile_id:
-            return self.DEFAULT_BROWSER
-        return next((label for label, pid in choices.items() if pid == profile_id),
-                    f"Missing profile ({profile_id.split('|')[-1]})")
+        return ui_model.profile_label(profile_id, choices)
 
     def save_options(self):
-        choice = self.interval_menu.get()
-        minutes = INTERVALS.get(choice, self.app.cfg.get("interval_minutes", 15))
-        cfg = dict(self.app.cfg, interval_minutes=minutes, notify_on_changes=self.notify_var.get(),
-                   watch_changes=self.watch_var.get(),
-                   drive_poll_seconds=POLLS.get(self.poll_menu.get(), 10),
-                   high_priority=self.priority_btn.get() == "High",
-                   pause_on_metered=self.metered_var.get(),
-                   auto_update=self.auto_update_var.get(),
-                   speed_limit_kbps=LIMITS.get(self.limit_menu.get(), self.app.cfg.get("speed_limit_kbps", 0)))
+        cfg = ui_model.options_cfg(self.app.cfg, interval=self.interval_menu.get(), poll=self.poll_menu.get(),
+                                   limit=self.limit_menu.get(), priority=self.priority_btn.get(),
+                                   watch=self.watch_var.get(), notify=self.notify_var.get(),
+                                   metered=self.metered_var.get(), auto_update=self.auto_update_var.get())
         if cfg != self.app.cfg:
             self.app.save_config(cfg)
 
@@ -1135,7 +979,7 @@ class MainWindow:
             return
         self.refresh_account()
         if not self.app.accounts_info() or messagebox.askyesno(
-                "Drive Sync", "credentials.json imported.\n\nSign in with a Google account now?",
+                "Drive Sync", ui_model.IMPORTED_ASK,
                 parent=self.root):
             self.add_account()
 
@@ -1145,11 +989,7 @@ class MainWindow:
             self.app.add_account(browser_profile=d.profile_id)
 
     def remove_account(self, email: str, n_folders: int):
-        warn = (f"\n\n{n_folders} folder{'s' if n_folders != 1 else ''} use this account and will stop "
-                "syncing until you choose another account for them.") if n_folders else ""
-        if messagebox.askyesno("Drive Sync", f"Remove {email} from Drive Sync?\n\nDrive Sync's access to this "
-                               f"account is revoked. Files already on Google Drive are not deleted.{warn}",
-                               parent=self.root):
+        if messagebox.askyesno("Drive Sync", ui_model.remove_account_question(email, n_folders), parent=self.root):
             self.app.set_account_profile(email, None)
             self.app.remove_account(email)
 
@@ -1157,16 +997,9 @@ class MainWindow:
         """Folders saved without an account (older versions / before any account existed) get this one."""
         if browser_profile:
             self.app.set_account_profile(email, browser_profile)
-        cfg = dict(self.app.cfg)
-        changed = False
-        folders = []
-        for f in cfg.get("folders", []):
-            if not f.get("account"):
-                f = {**f, "account": email}
-                changed = True
-            folders.append(f)
-        if changed:
-            self.app.save_config({**cfg, "folders": folders})
+        cfg = ui_model.assign_account(self.app.cfg, email)
+        if cfg is not None:
+            self.app.save_config(cfg)
         if self.built:
             self.refresh_account()
         self.app.notify(f"Google account added: {email}")

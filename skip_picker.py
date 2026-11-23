@@ -11,7 +11,6 @@ import fnmatch
 import glob
 import os
 import queue
-import re
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -22,85 +21,24 @@ MUTED = ("#5f6368", "#9aa0a6")
 CARD = ("#f1f3f4", "#2b2b2b")
 SECONDARY = {"fg_color": "transparent", "border_width": 1, "text_color": ("#1f1f1f", "#e3e3e3"),
              "border_color": ("#c4c7c5", "#5f6368"), "hover_color": ("#e8eaed", "#3c4043")}
-MAX_ROWS = 1000          # entries shown per folder in the tree (the rest are summed up in one row)
-OFF, ON, INHERITED = "☐", "☑", "▣"
-ONLY_DRIVE = "only on Google Drive"
-
-# (pattern, what it is) - things people commonly don't want synced.
-COMMON = [
-    (".git", "Git repositories"),
-    ("node_modules", "Node.js packages"),
-    (".venv", "Python virtual environments"),
-    ("venv", "Python virtual environments"),
-    ("__pycache__", "Python cache"),
-    (".vs", "Visual Studio files"),
-    ("*.log", "Log files"),
-    ("*.bak", "Backup copies"),
-    ("*.iso", "Disc images"),
-]
+# The plain helpers live in skip_model (no Tk needed for them); kept here under their old names.
+from skip_model import (  # noqa: E402, F401
+    COMMON,
+    INHERITED,
+    MAX_ROWS,
+    OFF,
+    ON,
+    ONLY_DRIVE,
+    describe,
+    drive_lister,
+    is_rule,
+    pattern_for,
+    split_patterns,
+)
 
 
 def font(size=13, weight="normal"):
     return ctk.CTkFont(family="Segoe UI", size=size, weight=weight)
-
-
-def pattern_for(rel: str) -> str:
-    """The pattern that skips exactly this path (relative to the synced folder, "/"-separated).
-    Brackets, * and ? in names are escaped so they match literally; a comma becomes ? because the
-    box separates patterns with commas."""
-    return glob.escape(rel).replace(",", "?")
-
-
-def split_patterns(text: str) -> list[str]:
-    return [x.strip() for x in text.split(",") if x.strip()]
-
-
-def is_rule(pattern: str) -> bool:
-    """A wildcard rule like *.log (rather than one picked file/folder)?"""
-    return any(c in "*?[" for c in re.sub(r"\[[*?\[]\]", "", pattern))
-
-
-def describe(pattern: str) -> tuple[str, str]:
-    """(short, full) text to show for a skip pattern: escapes undone, a path shortened to its name."""
-    if is_rule(pattern):
-        return pattern, pattern
-    full = re.sub(r"\[([*?\[])\]", r"\1", pattern)
-    return full.rsplit("/", 1)[-1], full
-
-
-def drive_lister(app, email: str, root_id: str | None, path: str):
-    """list(folder_id) for SkipPicker: what's in a folder of this synced folder's Drive side, as
-    [{"name", "id", "is_dir"}]. folder_id None = the synced Drive folder itself ([] if it doesn't
-    exist yet). Runs on the picker's background thread; one Drive connection, one call at a time."""
-    from drive_sync import FOLDER_MIME
-    lock, conn, root = threading.Lock(), {}, {"id": root_id}
-
-    def find_root(d):
-        parent = "root"
-        parts = [p for p in path.replace("\\", "/").split("/") if p]
-        if parts and parts[0].lower() == "my drive":
-            parts = parts[1:]
-        for part in parts:
-            parent = d.find_folder(part, parent)
-            if parent is None:
-                return None
-        return parent
-
-    def list_folder(folder_id):
-        with lock:
-            if "drive" not in conn:
-                conn["drive"] = app.drive_for_browsing(email)
-            d = conn["drive"]
-            if folder_id is None:
-                if root["id"] is None:
-                    root["id"] = find_root(d)
-                folder_id = root["id"]
-                if folder_id is None:
-                    return []
-            # Google Docs/Sheets, shortcuts etc. are never synced, so they aren't offered.
-            return [{"name": i["name"], "id": i["id"], "is_dir": i["mimeType"] == FOLDER_MIME}
-                    for i in d.list_children(folder_id) if i["mimeType"] == FOLDER_MIME or "md5Checksum" in i]
-    return list_folder
 
 
 class SkipPicker(ctk.CTkToplevel):

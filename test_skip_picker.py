@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -234,7 +235,9 @@ class DrivePickerTests(PickerTests):
         self.drive.web_add("EBC", "report.pdf", "r")
         self.app = types.SimpleNamespace(drive_for_browsing=lambda email: self.drive)
 
-    def open_drive(self, patterns, steps):
+    def open_drive(self, patterns, steps, gate=None):
+        """gate: a threading.Event the Drive listing waits for, so a test can look at the picker
+        before Drive's items arrive (without it, a fast listing can win the race)."""
         from skip_picker import SkipPicker, drive_lister
         seen = {}
 
@@ -249,6 +252,12 @@ class DrivePickerTests(PickerTests):
             steps(p, seen, lambda fn: wait_then(p, fn))
         self.root.after(200, run)
         lister = drive_lister(self.app, "me@example.com", None, "My Drive/EBC")
+        if gate is not None:
+            unguarded = lister
+
+            def lister(*args, **kwargs):
+                gate.wait(10)
+                return unguarded(*args, **kwargs)
         result = SkipPicker(self.root, self.tmp.name, patterns, drive_list=lister, drive_label="My Drive/EBC").result
         return result, seen
 
@@ -295,8 +304,11 @@ class DrivePickerTests(PickerTests):
                                                          pattern_for("Photos [2024]"): "pc"})
 
     def test_reopening_ticks_saved_drive_only_items(self):
+        gate = threading.Event()
+
         def steps(p, seen, wait):
-            seen["before"] = list(p.other)
+            seen["before"] = list(p.other)    # Drive's items can't have arrived: the listing waits for gate
+            gate.set()
 
             def loaded():
                 seen["after"] = list(p.other)
@@ -304,7 +316,7 @@ class DrivePickerTests(PickerTests):
                 p.done()
             wait(loaded)
 
-        result, seen = self.open_drive(["Big Drive Only", "*.psd"], steps)
+        result, seen = self.open_drive(["Big Drive Only", "*.psd"], steps, gate)
         self.assertEqual(seen["before"], ["Big Drive Only", "*.psd"])
         self.assertEqual(seen["after"], ["*.psd"])
         self.assertTrue(seen["text"].startswith("☑"))
