@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from string import Template
 
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import QApplication, QWidget
 
 # The white tick drawn in checked boxes (inside the .exe when frozen).
@@ -33,13 +33,16 @@ THEMES = {
         "switch_off": "#5f6368",
     },
 }
+# Segoe UI first; it has no Khmer letters, so Khmer comes from Khmer UI (else Qt borrows them from a
+# font that draws Khmer at half the size). Both ship with Windows.
+FONT_FAMILIES = ["Segoe UI", "Khmer UI", "Leelawadee UI"]
 # The status dot (same colours as the tray icon's states and the Tk window).
 STATE_COLORS = {"idle": "#1a73e8", "syncing": "#f9ab00", "error": "#d93025", "paused": "#80868b"}
 # ui_model's tones -> theme colour names
 TONE_KEYS = {"error": "red", "waiting": "amber", "muted": "muted", "link": "link", "ok": "green"}
 
 QSS = Template("""
-* { font-family: "Segoe UI"; font-size: 10pt; color: $text; }
+* { font-family: $fonts; font-size: 10pt; color: $text; }
 QMainWindow, #root { background: $window; }
 QLabel { background: transparent; }
 QLabel[role="title"] { font-size: 16pt; font-weight: 700; }   /* bold, like the Tk window */
@@ -122,7 +125,8 @@ def stylesheet(name: str) -> str:
     rules += [f'QLabel[role="smalldot"][state="{s}"] {{ background: {c}; }}' for s, c in ui_model.DOT_COLORS.items()]
     badges = {**{k: c for k, (_label, c) in ui_model.BADGES.items()}, "other": "#80868b"}
     rules += [f'QLabel[role="badge"][kind="{k}"] {{ background: {c}; }}' for k, c in badges.items()]
-    return QSS.substitute(THEMES[name], dots="\n".join(rules), check=CHECK_IMAGE)
+    fonts = ", ".join(f'"{f}"' for f in FONT_FAMILIES)
+    return QSS.substitute(THEMES[name], dots="\n".join(rules), check=CHECK_IMAGE, fonts=fonts)
 
 
 def apply(qapp: QApplication, appearance: str) -> str:
@@ -131,6 +135,11 @@ def apply(qapp: QApplication, appearance: str) -> str:
     _current["name"] = name
     if qapp.style().name().lower() != "fusion":
         qapp.setStyle("Fusion")    # the same look on every Windows version; colours come from the stylesheet
+    if qapp.font().families()[:len(FONT_FAMILIES)] != FONT_FAMILIES:
+        font = QFont(qapp.font())
+        font.setFamilies(FONT_FAMILIES)   # also for what the stylesheet doesn't reach (e.g. tree rows)
+        font.setPointSize(10)
+        qapp.setFont(font)
     sheet = stylesheet(name)
     if qapp.styleSheet() != sheet:  # setting it restyles every widget: only when it really changes
         qapp.setPalette(palette(name))   # what Fusion draws itself: check boxes, menu arrows, text cursor
