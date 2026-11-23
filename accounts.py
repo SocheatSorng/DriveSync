@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import socket
+import time
 from pathlib import Path
 
 from drive_sync import APP_DIR, SCOPES
@@ -100,12 +102,40 @@ def remove_account(email: str, base: Path | None = None, revoke: bool = True) ->
     path.unlink(missing_ok=True)
 
 
+def free_port() -> int:
+    """A port nothing is listening on, for the sign-in's local web server."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def cancel_sign_in(port: int, wait: float = 5.0) -> bool:
+    """Stop a sign-in that is waiting for the browser (e.g. the user closed the browser).
+
+    Closing the browser tells Drive Sync nothing, so the sign-in's local web server would wait
+    until it times out. Sending it an "error" reply, as Google does when access is denied, ends
+    the wait at once. Retries for a moment in case the server isn't listening yet.
+    True if the server got it."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
+                s.sendall(b"GET /?error=cancelled HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                s.recv(1)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
+
 def sign_in(credentials_path: Path, login_hint: str | None = None, timeout: int = 300,
-            browser_profile: str | None = None):
+            browser_profile: str | None = None, port: int = 0):
     """Open the browser so the user can pick a Google account. Returns new credentials.
 
     browser_profile: open Google's sign-in page in this browser profile (see browsers.py)
     instead of whichever profile the default browser used last.
+    port: the local web server's port (see free_port), so cancel_sign_in can stop the wait.
     """
     from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -118,7 +148,7 @@ def sign_in(credentials_path: Path, login_hint: str | None = None, timeout: int 
     if login_hint:
         extra["login_hint"] = login_hint
     return flow.run_local_server(
-        port=0, timeout_seconds=timeout, authorization_prompt_message="",
+        port=port, timeout_seconds=timeout, authorization_prompt_message="",
         success_message="Signed in to Drive Sync. You can close this tab.",
         browser=browsers.register_controller(browser_profile), **extra)
 

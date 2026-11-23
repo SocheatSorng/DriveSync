@@ -212,6 +212,8 @@ class App:
         self.drives: dict[str, Drive] = {}          # email -> connected Drive (worker thread only)
         self.needs_signin: set[str] = set()         # accounts whose login expired / was revoked
         self.signing_in: str | None = None          # "new" or an email while the browser flow runs
+        self.signin_port = 0                        # its local web server (to cancel it)
+        self.signin_cancelled = False               # Cancel was pressed: no error message
         self.force_full = False                     # "Sync now" pressed
         self.resume_full = False                    # a full check was paused part-way: finish it on resume
         self.storage_full: dict[str, set[str]] = {}  # last sync: "drive" -> accounts, "pc" -> folders
@@ -1127,6 +1129,8 @@ class App:
         if self.signing_in or not CREDS_PATH.exists():
             return
         self.signing_in = login_hint or "new"
+        self.signin_cancelled = False
+        self.signin_port = accounts.free_port()
         self.ui.put(("account",))
         if browser_profile is None and login_hint:
             browser_profile = self.account_profile(login_hint)
@@ -1135,7 +1139,8 @@ class App:
     def _sign_in_thread(self, login_hint: str | None, browser_profile: str | None = None):
         log.info("Sign-in started (%s) - waiting for the browser", login_hint or "new account")
         try:
-            creds = accounts.sign_in(CREDS_PATH, login_hint=login_hint, browser_profile=browser_profile)
+            creds = accounts.sign_in(CREDS_PATH, login_hint=login_hint, browser_profile=browser_profile,
+                                     port=self.signin_port)
             email = accounts.account_email(build_service(creds))
             accounts.save_account(email, creds.to_json())
             self.drives.pop(email, None)
@@ -1145,12 +1150,24 @@ class App:
             self.ui.put(("account_added", email, browser_profile))
             self.wake.set()
         except Exception as e:  # noqa: BLE001 - closed the tab, timed out, denied access, ...
+            if self.signin_cancelled:
+                log.info("Sign-in cancelled")
+                return
             log.error("Sign-in didn't finish: %s", e)
             self.record_event("warning", "Sign-in didn't finish", str(e)[:300])
             self.ui.put(("error", sign_in_failure_text(e)))
         finally:
             self.signing_in = None
             self.ui.put(("account",))
+
+    def cancel_sign_in(self) -> None:
+        """The "Cancel" button beside "Waiting for browser…": the browser was closed, or the user
+        changed their mind. The browser can't tell Drive Sync it was closed, so this ends the wait."""
+        if not self.signing_in or self.signin_cancelled:
+            return
+        self.signin_cancelled = True
+        log.info("Cancelling sign-in")
+        threading.Thread(target=accounts.cancel_sign_in, args=(self.signin_port,), daemon=True).start()
 
     def remove_account(self, email: str):
         def work():

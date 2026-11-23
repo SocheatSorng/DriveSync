@@ -640,6 +640,9 @@ class MainWindow:
         self.add_account_btn = ctk.CTkButton(row, text="+  Add Google account", width=170,
                                              command=self.add_account)
         self.add_account_btn.pack(side="left")
+        # Shown only while waiting: closing the browser can't be detected, so this ends the wait.
+        self.cancel_signin_btn = ctk.CTkButton(row, text="Cancel", width=80, command=self.app.cancel_sign_in,
+                                               **SECONDARY)
         self.import_btn = ctk.CTkButton(row, text="Import credentials.json…", width=180,
                                         command=self.import_credentials, **SECONDARY)
         self.import_btn.pack(side="left", padx=(8, 0))
@@ -956,7 +959,7 @@ class MainWindow:
                     "The setup guide explains each step.")
         elif busy:
             text = ("Waiting for you in the browser… choose the Google account and allow access. "
-                    "(This window updates by itself when you're done.)")
+                    "(This window updates by itself when you're done. Closed the browser? Press Cancel.)")
         elif not info:
             text = ("Add the Google account to back up to. Your browser opens so you can choose which "
                     "account - you can add more than one and pick one per folder.")
@@ -966,6 +969,10 @@ class MainWindow:
         self.account_lbl.configure(text=text)
         self.add_account_btn.configure(state="normal" if ready and not busy else "disabled",
                                        text="Waiting for browser…" if busy else "+  Add Google account")
+        if busy:
+            self.cancel_signin_btn.pack(side="left", padx=(8, 0), after=self.add_account_btn)
+        else:
+            self.cancel_signin_btn.pack_forget()
 
         for w in self.accounts_box.winfo_children():
             w.destroy()

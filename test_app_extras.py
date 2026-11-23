@@ -265,5 +265,43 @@ class SignInFailureTextTests(unittest.TestCase):
         self.assertIn("drive.googleapis.com/overview?project=1091363161830", text)
 
 
+class CancelSignInAppTests(unittest.TestCase):
+    def _app(self):
+        app = bare_app()
+        app.signing_in, app.signin_port, app.signin_cancelled = None, 0, False
+        app.record_event = mock.Mock()
+        return app
+
+    def test_cancel_ends_the_wait_without_an_error_message(self):
+        app = self._app()
+        app.signing_in, app.signin_port = "new", 12345
+        with mock.patch.object(tray_app.accounts, "cancel_sign_in") as cancel:
+            app.cancel_sign_in()
+            app.cancel_sign_in()                     # pressed twice: still one cancel
+            deadline = time.monotonic() + 2
+            while not cancel.called and time.monotonic() < deadline:
+                time.sleep(0.01)
+        cancel.assert_called_once_with(12345)
+        with mock.patch.object(tray_app.accounts, "sign_in", side_effect=Exception("cancelled")):
+            app._sign_in_thread(None)
+        sent = [c.args[0] for c in app.ui.put.call_args_list]
+        self.assertNotIn("error", [m[0] for m in sent])
+        self.assertIsNone(app.signing_in)
+        app.record_event.assert_not_called()
+
+    def test_cancel_when_not_signing_in_does_nothing(self):
+        app = self._app()
+        with mock.patch.object(tray_app.accounts, "cancel_sign_in") as cancel:
+            app.cancel_sign_in()
+        cancel.assert_not_called()
+
+    def test_a_real_failure_still_shows_an_error(self):
+        app = self._app()
+        app.signing_in = "new"
+        with mock.patch.object(tray_app.accounts, "sign_in", side_effect=Exception("access_denied")):
+            app._sign_in_thread(None)
+        self.assertIn("error", [c.args[0][0] for c in app.ui.put.call_args_list])
+
+
 if __name__ == "__main__":
     unittest.main()
