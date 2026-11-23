@@ -8,6 +8,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 import activity
+import smooth_scroll
 
 MUTED = ("#5f6368", "#9aa0a6")
 CARD = ("#f1f3f4", "#2b2b2b")
@@ -28,6 +29,75 @@ DETAILS = 200         # file rows shown per card
 
 def font(size=13, weight="normal"):
     return ctk.CTkFont(family="Segoe UI", size=size, weight=weight)
+
+
+def detail_lines(items: list[dict], times: list[str], hidden: int) -> list[tuple[str, tuple[str, ...]]]:
+    """A card's file list as (text, tags) pieces for one text box: a coloured badge, the path, the
+    time it finished (blank while it's the same minute as the row above), and any message under it."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for it, when in zip(items, times, strict=True):
+        kind = it["kind"] if it["kind"] in BADGES else "other"
+        label = BADGES[kind][0] if kind in BADGES else it["kind"]
+        path = it["path"] if it["path"] != "." else "(whole folder)"
+        out.append((f" {label} ", ("row", f"badge-{kind}")))
+        out.append((f"\t{path}", ("row",)))
+        if when:
+            out.append((f"   {when}", ("row", "muted")))
+        out.append(("\n", ("row",)))
+        if it.get("message"):
+            out.append((it["message"] + "\n", ("note", "red" if it["kind"] == "error" else "muted")))
+    if hidden:
+        out.append((f"…and {hidden} more (full list in the log file)\n", ("note", "muted")))
+    return out
+
+
+def fill_details(box: ctk.CTkTextbox, items: list[dict], times: list[str], hidden: int) -> None:
+    """Write a card's file list into its text box and make the box exactly as tall as the text."""
+    t = box._textbox                        # the tk.Text inside (CTkTextbox won't set fonts on tags)
+    scale = box._get_widget_scaling()
+    dark = ctk.get_appearance_mode() == "Dark"
+
+    def px(v: float) -> int:
+        return int(round(v * scale))
+
+    def small(weight: str = "normal") -> tuple:
+        return ("Segoe UI", -px(11), weight)   # negative: pixels, scaled like CTk's own fonts
+
+    indent = px(96)                         # paths line up after the badges, wrapped lines too
+    t.configure(tabs=(indent,), spacing1=px(3), spacing3=px(3), cursor="arrow")
+    t.tag_configure("row", lmargin1=px(4), lmargin2=indent)
+    t.tag_configure("note", lmargin1=indent, lmargin2=indent, font=small())
+    t.tag_configure("muted", foreground=MUTED[dark], font=small())
+    t.tag_configure("red", foreground=("#d93025", "#f28b82")[dark])
+    for kind, (_label, color) in [*BADGES.items(), ("other", ("", GRAY))]:
+        t.tag_configure(f"badge-{kind}", background=color, foreground="white", font=small("bold"))
+    for text, tags in detail_lines(items, times, hidden):
+        t.insert("end", text, tags)
+    t.delete("end-2c")                      # the last newline (Text keeps one of its own)
+    box.configure(state="disabled")         # read-only; paths can still be selected and copied
+
+    def fit(_event=None) -> None:
+        """As tall as the wrapped text, so the card never scrolls inside itself."""
+        try:
+            n = t.count("1.0", "end", "ypixels")
+        except Exception:  # noqa: BLE001 - window closing
+            return
+        n = (n[0] if isinstance(n, tuple) else n) or 0
+        want = int((n + px(6) * 2 + px(4)) / scale)
+        if want > 0 and abs(box.cget("height") - want) > 1:
+            box.configure(height=want)
+    t.bind("<Configure>", fit, add="+")
+
+    def wheel(event):
+        """The mouse wheel scrolls the Activity list, as over the rest of the card (a text box
+        would otherwise keep the wheel for itself)."""
+        w = box.master
+        while w is not None and not isinstance(w, ctk.CTkScrollableFrame):
+            w = getattr(w, "master", None)
+        if w is not None:   # CTkScrollableFrame itself ignores wheels from text boxes
+            smooth_scroll.queue_scroll(w, event.delta)
+        return "break"
+    t.bind("<MouseWheel>", wheel)
 
 
 def entry_id(e: dict) -> str:
@@ -204,34 +274,16 @@ class ActivityView:
         self.render()
 
     def _details(self, card, e: dict) -> None:
-        box = ctk.CTkFrame(card, fg_color=("#ffffff", "#333333"), corner_radius=8)
-        box.grid(row=3, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 12))
-        box.columnconfigure(1, weight=1)
+        """The card's file list, drawn as ONE text box. One label per badge, path and time made
+        3 Windows controls each - a 200-file card was ~1,800 of them, and Windows moves every one
+        with the window, so dragging the window lagged badly."""
         items = sorted(e["items"], key=lambda i: ORDER.index(i["kind"]) if i["kind"] in ORDER else 99)
         q = self.query.strip().lower()
         if q:  # when searching, show matching files first
             items.sort(key=lambda i: q not in i["path"].lower())
         shown = items[:DETAILS]
-        times = activity.item_times(shown, e["ts"])
-        row = 0
-        for it, when in zip(shown, times, strict=True):
-            label, color = BADGES.get(it["kind"], (it["kind"], GRAY))
-            ctk.CTkLabel(box, text=label, font=font(11, "bold"), text_color="white", fg_color=color,
-                         corner_radius=6, width=78, height=20).grid(
-                row=row, column=0, padx=(10, 8), pady=3, sticky="nw")
-            path = it["path"] if it["path"] != "." else "(whole folder)"
-            ctk.CTkLabel(box, text=path, font=font(12), anchor="w", justify="left", wraplength=480).grid(
-                row=row, column=1, sticky="w", pady=3)
-            if when:  # when the file finished; blank while it's the same minute as the row above
-                ctk.CTkLabel(box, text=when, font=font(11), text_color=MUTED).grid(
-                    row=row, column=2, padx=(8, 10), pady=3, sticky="e")
-            row += 1
-            if it.get("message"):
-                ctk.CTkLabel(box, text=it["message"], font=font(11), text_color=RED if it["kind"] == "error"
-                             else MUTED, anchor="w", justify="left", wraplength=480).grid(
-                    row=row, column=1, sticky="w", pady=(0, 4))
-                row += 1
         hidden = max(0, len(items) - DETAILS) + e.get("more", 0)
-        if hidden:
-            ctk.CTkLabel(box, text=f"…and {hidden} more (full list in the log file)", font=font(11),
-                         text_color=MUTED, anchor="w").grid(row=row, column=1, sticky="w", pady=(2, 6))
+        box = ctk.CTkTextbox(card, fg_color=("#ffffff", "#333333"), corner_radius=8, border_spacing=6,
+                             font=font(12), activate_scrollbars=False, wrap="word", height=40)
+        box.grid(row=3, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 12))
+        fill_details(box, shown, activity.item_times(shown, e["ts"]), hidden)

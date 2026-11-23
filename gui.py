@@ -12,11 +12,14 @@ from urllib.parse import urlencode
 import customtkinter as ctk
 
 import browsers
+import smooth_scroll
 import updater
 from activity_view import ActivityView
 from skip_picker import split_patterns
 from space_view import SpaceView
 from version import __version__
+
+smooth_scroll.install()   # before any scrollable frame is made
 
 STATE_COLORS = {"idle": "#1a73e8", "syncing": "#f9ab00", "error": "#d93025", "paused": "#80868b"}
 MUTED = ("#5f6368", "#9aa0a6")          # (light, dark)
