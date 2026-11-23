@@ -25,4 +25,5 @@ venv/
 build/
 dist/
 *.spec
+!DriveSync.spec
 .ruff_cache/

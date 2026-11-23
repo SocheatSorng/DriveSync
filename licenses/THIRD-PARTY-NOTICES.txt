@@ -1,0 +1,21 @@
+Drive Sync - third-party software notices
+=========================================
+
+Qt for Python (PySide6, shiboken6) and Qt 6
+-------------------------------------------
+Drive Sync's window uses Qt for Python (PySide6 and shiboken6) and the Qt 6 libraries,
+Copyright (C) The Qt Company Ltd. and other contributors.
+
+They are used under the GNU Lesser General Public License version 3 (LGPL-3.0). The full texts
+of the LGPL-3.0 and of the GNU General Public License version 3, which it refers to, are in this
+folder: LGPL-3.0.txt and GPL-3.0.txt.
+
+Drive Sync uses these libraries unmodified, as separate dynamic libraries (DLLs). In an installed
+copy they are in the "_internal\PySide6" and "_internal\shiboken6" folders next to DriveSync.exe;
+you may replace them with your own compatible build of the same Qt and PySide6 version.
+
+Source code:
+  - Qt for Python (PySide6, shiboken6): https://code.qt.io/cgit/pyside/pyside-setup.git/
+  - Qt 6:                               https://code.qt.io/cgit/qt/qt5.git/
+  - Downloads of the exact releases:    https://download.qt.io/official_releases/QtForPython/
+The version shipped is shown in Drive Sync's log ("Qt for Python x.y.z") and in uv.lock.

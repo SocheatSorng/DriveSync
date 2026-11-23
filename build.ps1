@@ -1,5 +1,6 @@
 <#
-  Builds dist\DriveSync.exe - a single file that runs without Python installed.
+  Builds Drive Sync without needing Python installed: dist\DriveSync\ (one folder, what Setup installs),
+  dist\DriveSync.exe (one portable file) and dist\DriveSync-Setup.exe.
   Used by CI (.github/workflows/ci.yml) and works locally too:
     uv run powershell -ExecutionPolicy Bypass -File build.ps1
 #>
@@ -11,23 +12,25 @@ Set-Location $PSScriptRoot
 $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $python = if (Test-Path $venvPython) { $venvPython } else { "python" }
 
-& $python -c "import watchdog, pystray, customtkinter, send2trash, PIL, requests, googleapiclient, google_auth_oauthlib, PyInstaller"
+& $python -c "import watchdog, pystray, customtkinter, PySide6.QtWidgets, send2trash, PIL, requests, googleapiclient, google_auth_oauthlib, PyInstaller"
 if ($LASTEXITCODE -ne 0) {
     throw "$python is missing packages the app needs. Run 'uv sync' (or pip install -r requirements.txt pyinstaller) first."
 }
 
-& $python -m PyInstaller --noconfirm --clean --onefile --windowed `
-    --name DriveSync `
-    --icon assets\drivesync.ico `
-    --add-data "README.md;." `
-    --add-data "assets;assets" `
-    --collect-data customtkinter `
-    --hidden-import pystray._win32 `
-    --hidden-import watchdog.observers.read_directory_changes `
-    --collect-submodules send2trash `
-    tray_app.py
-if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
+# DriveSync.spec says what goes in (and leaves out Qt parts and Google API documents the app doesn't use).
+# Two builds of the same app:
+#   dist\DriveSync\      one folder - what Setup installs: starts in ~0.7 s (a single file unpacks itself
+#                         to a temp folder on every start: 3.5-5 s), and Qt's DLLs stay replaceable (LGPL)
+#   dist\DriveSync.exe   one file  - the portable copy in releases, for people who don't install
+$env:DRIVESYNC_ONEDIR = "1"
+& $python -m PyInstaller --noconfirm --clean --workpath build\onedir DriveSync.spec
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (one-folder build)" }
+$env:DRIVESYNC_ONEDIR = $null
+& $python -m PyInstaller --noconfirm --clean --workpath build\onefile DriveSync.spec
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (one-file build)" }
 
+$folder = Get-ChildItem dist\DriveSync -Recurse -File
+Write-Host ("Built {0} ({1:N1} MB in {2} files)" -f (Resolve-Path dist\DriveSync), (($folder | Measure-Object Length -Sum).Sum / 1MB), $folder.Count)
 $exe = Get-Item dist\DriveSync.exe
 Write-Host ("Built {0} ({1:N1} MB)" -f $exe.FullName, ($exe.Length / 1MB))
 

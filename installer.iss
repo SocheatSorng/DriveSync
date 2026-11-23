@@ -44,8 +44,13 @@ VersionInfoProductName=Drive Sync
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
 Name: "startup"; Description: "Start Drive Sync when I sign in to Windows"; Check: not WizardSilent
 
+[InstallDelete]
+; The one-folder build's libraries: replaced as a whole, so nothing from an older version is left behind.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
-Source: "dist\DriveSync.exe"; DestDir: "{app}"; Flags: ignoreversion
+; One-folder build (starts much faster than a single .exe, and Qt's LGPL DLLs stay replaceable).
+Source: "dist\DriveSync\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{userprograms}\Drive Sync"; Filename: "{app}\DriveSync.exe"
