@@ -21,6 +21,9 @@ from version import __version__
 STATE_COLORS = {"idle": "#1a73e8", "syncing": "#f9ab00", "error": "#d93025", "paused": "#80868b"}
 MUTED = ("#5f6368", "#9aa0a6")          # (light, dark)
 CARD = ("#f1f3f4", "#2b2b2b")
+SURFACE = ("#ffffff", "#333333")        # a card that sits straight on a tab (CARD matches the tab in dark mode)
+BAR_TRACK = ("#e3e3e3", "#3c4043")      # the empty part of a progress bar
+ERROR_TEXT = ("#d93025", "#f28b82")
 SECONDARY = {"fg_color": "transparent", "border_width": 1, "text_color": ("#1f1f1f", "#e3e3e3"),
              "border_color": ("#c4c7c5", "#5f6368"), "hover_color": ("#e8eaed", "#3c4043")}
 DANGER = {"fg_color": "transparent", "text_color": ("#d93025", "#f28b82"),
@@ -560,8 +563,8 @@ class MainWindow:
         hdr = ctk.CTkFrame(root, fg_color="transparent")
         hdr.pack(fill="x", padx=22, pady=(18, 6))
         hdr.columnconfigure(1, weight=1)
-        self.dot = ctk.CTkLabel(hdr, text="●", font=font(22), width=24)
-        self.dot.grid(row=0, column=0, rowspan=2, padx=(0, 10))
+        self.dot = ctk.CTkLabel(hdr, text="●", font=font(18), width=20)
+        self.dot.grid(row=0, column=0, padx=(0, 8))        # beside the status, however many lines follow
         self.status_lbl = ctk.CTkLabel(hdr, text="", font=font(18, "bold"), anchor="w")
         self.status_lbl.grid(row=0, column=1, sticky="w")
         self.detail_lbl = ctk.CTkLabel(hdr, text="", font=font(12), text_color=MUTED, anchor="w", justify="left")
@@ -573,7 +576,7 @@ class MainWindow:
         self.sync_btn = ctk.CTkButton(hdr, text="Sync now", width=110, command=app.sync_now,
                                       font=font(13, "bold"))
         self.sync_btn.grid(row=0, column=3, padx=(8, 0))
-        self.bar = ctk.CTkProgressBar(hdr, height=6, corner_radius=3)
+        self.bar = ctk.CTkProgressBar(hdr, height=6, corner_radius=3, fg_color=BAR_TRACK)
         self.bar.set(0)
 
         tabs = ctk.CTkTabview(root, anchor="nw")
@@ -597,7 +600,7 @@ class MainWindow:
         for w in self.root.winfo_children():
             w.destroy()
         for attr in ("tabs", "activity_view", "space_view", "folder_list", "accounts_box", "dot", "status_lbl",
-                     "detail_lbl", "pause_btn", "sync_btn", "bar"):
+                     "detail_lbl", "pause_btn", "sync_btn", "bar", "add_btn", "drive_btn"):
             self.__dict__.pop(attr, None)
         import gc
         gc.collect()
@@ -605,11 +608,13 @@ class MainWindow:
     # ------------------------------------------------------------------ tabs
     def _build_folders(self, tab):
         top = ctk.CTkFrame(tab, fg_color="transparent")
-        top.pack(fill="x", padx=6, pady=(4, 8))
+        top.pack(fill="x", padx=8, pady=(4, 8))
         ctk.CTkLabel(top, text="Folders backed up to Google Drive", font=font(14, "bold")).pack(side="left")
-        ctk.CTkButton(top, text="+  Add folder", width=120, command=self.add_folder).pack(side="right")
-        ctk.CTkButton(top, text="Open Google Drive", width=140, command=lambda: self.open_drive(None),
-                      **SECONDARY).pack(side="right", padx=(0, 8))
+        self.add_btn = ctk.CTkButton(top, text="+  Add folder", width=120, command=self.add_folder)
+        self.add_btn.pack(side="right")
+        self.drive_btn = ctk.CTkButton(top, text="Open Google Drive", width=140, command=lambda: self.open_drive(None),
+                                       **SECONDARY)
+        self.drive_btn.pack(side="right", padx=(0, 8))
         self.folder_list = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         self.folder_list.pack(fill="both", expand=True)
 
@@ -764,7 +769,7 @@ class MainWindow:
         self.sync_btn.configure(state="disabled" if app.state == "syncing" else "normal")
         prog = app.progress
         if app.state == "syncing" and prog is not None and prog.total:
-            self.bar.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+            self.bar.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(8, 0))
             self.bar.set(prog.percent / 100)
         else:
             self.bar.grid_remove()
@@ -834,14 +839,14 @@ class MainWindow:
             full = describe(p)[1]
             badge, color, meaning = self.SKIP_SIDES[side] if side else ("", None, "Not synced either way.")
             text = f"{short}  ·  {badge}" if badge else short
-            chip = ctk.CTkLabel(row, text=text, font=font(11), **self.CHIP,
+            chip = ctk.CTkLabel(row, text=text, font=font(12), **self.CHIP,
                                 **({"text_color": color} if color else {}))
             chip.pack(side="left", padx=(0, 4), ipadx=6)
             Tooltip(chip, f"{full}\n{meaning}\n\nClick to change what's skipped.")
             chips.append(chip)
         rest = skips[len(shown):]
         if rest:
-            more = ctk.CTkLabel(row, text=f"+{len(rest)} more", font=font(11), text_color=("#1a73e8", "#8ab4f8"),
+            more = ctk.CTkLabel(row, text=f"+{len(rest)} more", font=font(12), text_color=("#1a73e8", "#8ab4f8"),
                                 **self.CHIP)
             more.pack(side="left", ipadx=6)
             lines = []
@@ -860,22 +865,35 @@ class MainWindow:
             w.destroy()
         folders = self.app.cfg.get("folders", [])
         if not folders:
-            box = ctk.CTkFrame(self.folder_list, fg_color=CARD, corner_radius=10)
-            box.pack(fill="x", padx=4, pady=30)
-            ctk.CTkLabel(box, text="No folders yet", font=font(15, "bold")).pack(pady=(22, 2))
-            ctk.CTkLabel(box, text="Choose a folder on this PC and Drive Sync will keep a copy in Google Drive.",
-                         font=font(), text_color=MUTED).pack()
-            ctk.CTkButton(box, text="+  Add folder", width=130, command=self.add_folder).pack(pady=(14, 22))
+            self.add_btn.pack_forget()    # the empty card has the one Add folder button
+            box = ctk.CTkFrame(self.folder_list, fg_color=SURFACE, corner_radius=10)
+            box.pack(fill="x", padx=(0, 8), pady=(24, 0))
+            ctk.CTkLabel(box, text="Back up your first folder", font=font(14, "bold")).pack(padx=24, pady=(32, 4))
+            hint = ctk.CTkLabel(box, text="Choose a folder on this PC and Drive Sync will keep a copy in Google Drive.",
+                                font=font(12), text_color=MUTED, justify="center")
+            hint.pack(padx=24)
+            autowrap(hint, box, margin=48)
+            ctk.CTkButton(box, text="+  Add folder", width=130, command=self.add_folder).pack(pady=(16, 32))
             return
+        if not self.add_btn.winfo_manager():
+            self.add_btn.pack(side="right", before=self.drive_btn)
         info = self.app.accounts_info()
         known = [a["email"] for a in info]
         signin = {a["email"] for a in info if a["needs_signin"]}
         for i, f in enumerate(folders):
-            c = ctk.CTkFrame(self.folder_list, fg_color=CARD, corner_radius=10)
-            c.pack(fill="x", padx=4, pady=(0, 8))
+            c = ctk.CTkFrame(self.folder_list, fg_color=SURFACE, corner_radius=10)
+            c.pack(fill="x", padx=(0, 8), pady=(0, 8))
             c.columnconfigure(0, weight=1)
-            title = ctk.CTkLabel(c, text=f.get("local", ""), font=font(13, "bold"), anchor="w", justify="left")
-            title.grid(row=0, column=0, sticky="w", padx=16, pady=(12, 0))
+            local = f.get("local", "")
+            # The folder's name as the title, the folder it's in underneath ("D:\" is shown whole).
+            name = os.path.basename(local.rstrip("\\/")) or local
+            parent = os.path.dirname(local.rstrip("\\/")) if name != local else ""
+            title = ctk.CTkLabel(c, text=name, font=font(14, "bold"), anchor="w", justify="left")
+            title.grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(12, 0))
+            where = ctk.CTkLabel(c, text=parent, font=font(12), text_color=MUTED, anchor="w", justify="left",
+                                 height=16)
+            if parent:
+                where.grid(row=1, column=0, columnspan=2, sticky="w", padx=16)
             if f.get("drive_folder_id"):   # chosen in the Drive browser: already a full path
                 target = f.get("drive_folder") or f"folder id {f['drive_folder_id']}"
             else:                          # typed path: always inside My Drive
@@ -884,37 +902,39 @@ class MainWindow:
                 extra = " · two-way"
             else:
                 extra = " · upload only" + (", Drive matches PC" if f.get("delete") else "")
-            exists = os.path.isdir(f.get("local", ""))
+            exists = os.path.isdir(local)
             email = self.app.folder_account(f, known)
             if not exists:
-                line, color = "⚠  This folder no longer exists on this PC", "#d93025"
+                line, color = "⚠  This folder no longer exists on this PC", ERROR_TEXT
             elif not email:
-                line, color = "⚠  No Google account - add one in Settings", "#d93025"
+                line, color = "⚠  No Google account - add one in Settings", ERROR_TEXT
             elif email not in known:
-                line, color = f"⚠  Account {email} was removed - click Edit to choose another", "#d93025"
+                line, color = f"⚠  Account {email} was removed - click Edit to choose another", ERROR_TEXT
             elif email in signin:
-                line, color = f"⚠  {email} needs to sign in again (Settings → Google accounts)", "#d93025"
+                line, color = f"⚠  {email} needs to sign in again (Settings → Google accounts)", ERROR_TEXT
             else:
                 arrow = "↔" if f.get("mode", "two_way") == "two_way" else "→"  # (⇄ isn't in Segoe UI)
                 line, color = f"{arrow}  {email} · {target}{extra}", MUTED
-            info = ctk.CTkLabel(c, text=line, font=font(12), text_color=color, anchor="w", justify="left")
+            info = ctk.CTkLabel(c, text=line, font=font(12), text_color=color, anchor="w", justify="left",
+                                height=16)
             # Full card width under the buttons, wrapping to the window's width.
             skips = f.get("exclude") or []
-            info.grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 4 if skips else 12))
+            info.grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 8 if skips else 12))
             if skips:
-                self._skip_row(c, skips, f.get("local", ""), lambda i=i: self.edit_folder(i),
+                self._skip_row(c, skips, local, lambda i=i: self.edit_folder(i),
                                f.get("exclude_where", {})).grid(
-                    row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 12))
+                    row=3, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 12))
             btns = ctk.CTkFrame(c, fg_color="transparent")
-            btns.grid(row=0, column=1, padx=12, pady=(10, 0))
+            btns.grid(row=0, column=1, sticky="ne", padx=(0, 12), pady=(12, 0))
+            autowrap(where, c, margin=40)
             autowrap(info, c, margin=40)
-            autowrap(title, c, margin=lambda b=btns: b.winfo_width() + 60)  # beside the buttons
+            autowrap(title, c, margin=lambda b=btns: b.winfo_width() + 48)  # beside the buttons
             for text, cmd, style in (("Open", lambda i=i: self.open_local(i), SECONDARY),
                                      ("Drive", lambda i=i: self.open_drive(i), SECONDARY),
                                      ("Edit", lambda i=i: self.edit_folder(i), SECONDARY),
                                      ("Remove", lambda i=i: self.remove_folder(i), DANGER)):
-                ctk.CTkButton(btns, text=text, width=64, height=28, command=cmd, **style).pack(
-                    side="left", padx=(6, 0))
+                ctk.CTkButton(btns, text=text, width=60, height=28, command=cmd, **style).pack(
+                    side="left", padx=(8, 0))
 
     def refresh_account(self):
         """Rebuild the Google accounts list in Settings (and folder cards, which show accounts)."""

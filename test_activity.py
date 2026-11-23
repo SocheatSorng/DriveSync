@@ -31,6 +31,26 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(activity.summary(r), "2 uploaded · 1 updated · 2 problems")
         self.assertEqual(activity.summary(run_with(("folder", "Unit 2"))), "1 new folder")
 
+    def test_each_file_records_when_it_finished(self):
+        before = time.time()
+        r = run_with(("uploaded", "a.docx"))
+        self.assertLessEqual(abs(r["items"][0]["t"] - before), 2)
+
+    def test_time_range_shows_when_a_long_run_ended(self):
+        start = datetime(2026, 11, 22, 22, 52, 10).timestamp()
+        r = {"ts": start, "duration": 20.0}
+        self.assertEqual(activity.time_range(r), "22:52")
+        r["duration"] = 2 * 3600 + 45 * 60
+        self.assertEqual(activity.time_range(r), "22:52 – 01:37")
+        self.assertEqual(activity.time_range({"ts": start}), "22:52")  # older entries without a duration
+
+    def test_item_times_read_like_a_timeline(self):
+        start = datetime(2026, 11, 22, 23, 58).timestamp()
+        items = [{"t": start + 10}, {"t": start + 20}, {"t": start + 70}, {},  # last: saved before times existed
+                 {"t": start + 150}, {"t": start + 155}]
+        self.assertEqual(activity.item_times(items, start),
+                         ["23:58", "", "23:59", "", "Mon 00:00", ""])
+
     def test_big_runs_are_capped_but_problems_never_dropped(self):
         r = run_with(*[("uploaded", f"f{i}") for i in range(activity.MAX_ITEMS + 50)])
         activity.add_item(r, "error", "late.docx", "locked")

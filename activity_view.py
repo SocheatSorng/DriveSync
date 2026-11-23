@@ -153,7 +153,7 @@ class ActivityView:
         ctk.CTkLabel(box, text=title, font=font(14, "bold")).pack(pady=(18, 2))
         ctk.CTkLabel(box, text=text, font=font(12), text_color=MUTED, wraplength=520).pack(pady=(0, 18))
 
-    def _card(self, color: str, title: str, subtitle: str, ts: float):
+    def _card(self, color: str, title: str, subtitle: str, when: str):
         c = ctk.CTkFrame(self.list, fg_color=CARD, corner_radius=10)
         c.pack(fill="x", padx=4, pady=(0, 6))
         c.columnconfigure(1, weight=1)
@@ -161,7 +161,7 @@ class ActivityView:
             row=0, column=0, rowspan=2, padx=(12, 6), pady=(10, 0), sticky="n")
         ctk.CTkLabel(c, text=title, font=font(13, "bold"), anchor="w", justify="left", wraplength=520).grid(
             row=0, column=1, sticky="w", pady=(9, 0))
-        ctk.CTkLabel(c, text=time.strftime("%H:%M", time.localtime(ts)), font=font(12), text_color=MUTED).grid(
+        ctk.CTkLabel(c, text=when, font=font(12), text_color=MUTED).grid(
             row=0, column=2, padx=12, pady=(9, 0), sticky="ne")
         ctk.CTkLabel(c, text=subtitle, font=font(12), text_color=MUTED, anchor="w", justify="left",
                      wraplength=560).grid(row=1, column=1, columnspan=2, sticky="w", pady=(0, 9))
@@ -169,7 +169,7 @@ class ActivityView:
 
     def _event_card(self, e: dict) -> None:
         color = {"error": RED, "warning": AMBER}.get(e.get("level"), BLUE)
-        self._card(color, e.get("message", ""), e.get("detail", ""), e["ts"])
+        self._card(color, e.get("message", ""), e.get("detail", ""), time.strftime("%H:%M", time.localtime(e["ts"])))
 
     def _run_card(self, e: dict) -> None:
         c = e["counts"]
@@ -178,7 +178,7 @@ class ActivityView:
         bits = [activity.summary(e), activity.TRIGGERS.get(e.get("trigger"), "")]
         if e.get("account"):
             bits.append(e["account"])
-        card = self._card(color, name, " · ".join(b for b in bits if b), e["ts"])
+        card = self._card(color, name, " · ".join(b for b in bits if b), activity.time_range(e))
 
         n = len(e["items"]) + e.get("more", 0)
         if not n:
@@ -211,8 +211,10 @@ class ActivityView:
         q = self.query.strip().lower()
         if q:  # when searching, show matching files first
             items.sort(key=lambda i: q not in i["path"].lower())
+        shown = items[:DETAILS]
+        times = activity.item_times(shown, e["ts"])
         row = 0
-        for it in items[:DETAILS]:
+        for it, when in zip(shown, times, strict=True):
             label, color = BADGES.get(it["kind"], (it["kind"], GRAY))
             ctk.CTkLabel(box, text=label, font=font(11, "bold"), text_color="white", fg_color=color,
                          corner_radius=6, width=78, height=20).grid(
@@ -220,6 +222,9 @@ class ActivityView:
             path = it["path"] if it["path"] != "." else "(whole folder)"
             ctk.CTkLabel(box, text=path, font=font(12), anchor="w", justify="left", wraplength=480).grid(
                 row=row, column=1, sticky="w", pady=3)
+            if when:  # when the file finished; blank while it's the same minute as the row above
+                ctk.CTkLabel(box, text=when, font=font(11), text_color=MUTED).grid(
+                    row=row, column=2, padx=(8, 10), pady=3, sticky="e")
             row += 1
             if it.get("message"):
                 ctk.CTkLabel(box, text=it["message"], font=font(11), text_color=RED if it["kind"] == "error"

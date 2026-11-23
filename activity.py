@@ -42,7 +42,7 @@ def new_run(folder: str, account: str | None, trigger: str, drive_folder: str = 
 def add_item(run: dict, kind: str, path: str, message: str | None = None) -> None:
     run["counts"][kind] = run["counts"].get(kind, 0) + 1
     if len(run["items"]) < MAX_ITEMS or kind == "error":  # never drop a problem
-        item = {"kind": kind, "path": path}
+        item = {"kind": kind, "path": path, "t": round(time.time())}  # when it finished (older entries have none)
         if message:
             item["message"] = message
         run["items"].append(item)
@@ -103,6 +103,31 @@ def matches(entry: dict, view: str, query: str) -> bool:
         hay = [entry.get("folder", ""), entry.get("account", ""), entry.get("drive_folder", "")]
         hay += [i["path"] for i in entry["items"]] + [i.get("message", "") for i in entry["items"]]
     return any(q in h.lower() for h in hay)
+
+
+def time_range(entry: dict) -> str:
+    """'22:52' for a quick run, '22:52 – 01:37' for one that ran into a later minute."""
+    start = time.strftime("%H:%M", time.localtime(entry["ts"]))
+    duration = entry.get("duration") or 0
+    end = time.strftime("%H:%M", time.localtime(entry["ts"] + duration))
+    return start if end == start else f"{start} – {end}"
+
+
+def item_times(items: list[dict], run_ts: float) -> list[str]:
+    """A time for each file row, '' when it's the same as the row above (so the list reads like a timeline).
+    Files finished on a later day than the run started show the weekday too ('Mon 00:12')."""
+    start_day = datetime.fromtimestamp(run_ts).date()
+    out, prev = [], None
+    for it in items:
+        t = it.get("t")
+        if t is None:
+            label = ""
+        else:
+            when = datetime.fromtimestamp(t)
+            label = when.strftime("%H:%M" if when.date() == start_day else "%a %H:%M")
+        out.append("" if label == prev else label)
+        prev = label
+    return out
 
 
 def day_label(ts: float, now: float | None = None) -> str:
