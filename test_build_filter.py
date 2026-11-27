@@ -1,6 +1,11 @@
 """Tests for what the PyInstaller build keeps and leaves out (build_filter.py, used by DriveSync.spec).
 Run:  python -m unittest test_build_filter -v
 """
+import hashlib
+import re
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -65,6 +70,29 @@ class VersionInfoTests(unittest.TestCase):
         spec = (Path(__file__).parent / "DriveSync.spec").read_text(encoding="utf-8")
         self.assertIn("version=version_info(__version__)", spec)
 
+
+@unittest.skipUnless(sys.platform == "win32", "build.ps1 runs on Windows")
+class SetupChecksumTests(unittest.TestCase):
+    """build.ps1 writes DriveSync-Setup.exe.sha256, which the updater checks before installing."""
+
+    def test_checksum_matches_and_needs_no_get_filehash(self):
+        # On CI, build.ps1 runs in Windows PowerShell started from PowerShell 7, and Get-FileHash wasn't
+        # found there ("not recognized"), so every CI build failed after building the exes. Plain .NET
+        # hashing needs no PowerShell module. Python's hashlib checks the result.
+        script = (Path(__file__).parent / "build.ps1").read_text(encoding="utf-8")
+        code = [line.split("#", 1)[0] for line in script.splitlines()]   # comments may mention it
+        self.assertFalse([line for line in code if "Get-FileHash" in line])
+        func = re.search(r"^function Get-Sha256Hex\b.*?^}", script, re.M | re.S)
+        self.assertIsNotNone(func, "build.ps1 defines Get-Sha256Hex")
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "setup.bin"
+            f.write_bytes(b"Drive Sync" * 1000)
+            out = subprocess.run(  # noqa: S603 - a fixed command on a test file
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",  # noqa: S607 - Windows PowerShell
+                 f"$ErrorActionPreference = 'Stop'; {func.group(0)}; Get-Sha256Hex '{f}'"],
+                capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), hashlib.sha256(b"Drive Sync" * 1000).hexdigest())
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,15 @@
     uv run powershell -ExecutionPolicy Bypass -File build.ps1
 #>
 $ErrorActionPreference = "Stop"
+
+# SHA-256 as lowercase hex, with .NET only. Not Get-FileHash: on CI this script runs in Windows PowerShell
+# started from PowerShell 7, and Get-FileHash isn't found there, which failed every CI build.
+function Get-Sha256Hex([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($path)
+    try { return ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace "-", "").ToLower() }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 Set-Location $PSScriptRoot
 
 # Use the project's .venv when there is one: a system Python may have PyInstaller but not the app's
@@ -49,6 +58,6 @@ if (-not $iscc) {
 & $iscc /Q "/DAppVersion=$version" installer.iss
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
 $setup = Get-Item dist\DriveSync-Setup.exe
-$hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+$hash = Get-Sha256Hex $setup.FullName
 Set-Content -Path "dist\DriveSync-Setup.exe.sha256" -Value "$hash  DriveSync-Setup.exe" -Encoding ascii -NoNewline
 Write-Host ("Built {0} ({1:N1} MB), version {2}" -f $setup.FullName, ($setup.Length / 1MB), $version)
