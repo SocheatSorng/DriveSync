@@ -190,7 +190,7 @@ class AnimationTests(unittest.TestCase):
     def test_syncing_shows_the_full_color_logo_not_amber(self):
         # the light covers only part of the outline, so most of the logo matches the idle icon
         idle, frame = tray_app.ICONS["idle"].tobytes(), tray_app.SYNC_FRAMES[5].tobytes()
-        same = sum(a == b for a, b in zip(idle[::4], frame[::4])) / (len(idle) // 4)
+        same = sum(a == b for a, b in zip(idle[::4], frame[::4], strict=True)) / (len(idle) // 4)
         self.assertGreater(same, 0.5)
 
 

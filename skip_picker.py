@@ -388,7 +388,7 @@ class SkipPicker(ctk.CTkToplevel):
 
     def done(self):
         self.result = self.result_patterns()
-        for rel, item in self.item_of.items():
+        for rel in self.item_of:
             p = pattern_for(rel)
             if p in self.paths:
                 w = self.where_of(rel)

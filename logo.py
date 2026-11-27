@@ -10,6 +10,7 @@ with a pause badge, a paused sync (grey).
 from __future__ import annotations
 
 import sys
+from itertools import pairwise
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw
@@ -93,7 +94,7 @@ def _lut(stops) -> list[float]:
     out = []
     for i in range(256):
         x = i / 255
-        (o0, v0), (o1, v1) = next(((s, e) for s, e in zip(stops, stops[1:]) if x <= e[0]), stops[-2:])
+        (o0, v0), (o1, v1) = next(((s, e) for s, e in pairwise(stops) if x <= e[0]), stops[-2:])
         f = 0 if o1 == o0 else min(1, max(0, (x - o0) / (o1 - o0)))
         out.append(v0 + (v1 - v0) * f)
     return out
@@ -182,7 +183,7 @@ def _outline_loop(big: int, n: int) -> list[tuple[float, float]]:
     oy = (big - (_Y1 - _Y0) * k) / 2 - _Y0 * k
     pts = _points(_FOLDER, lambda x, y: ((x - _X0) * k, oy + y * k))
     pts.append(pts[0])
-    seg = [((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 for (ax, ay), (bx, by) in zip(pts, pts[1:])]
+    seg = [((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 for (ax, ay), (bx, by) in pairwise(pts)]
     step, out, i, into = sum(seg) / n, [], 0, 0.0
     for j in range(n):
         want = j * step
