@@ -835,6 +835,12 @@ class MainWindow:
                 ctk.CTkButton(btns, text="Start syncing", width=110, height=28, font=font(13, "bold"),
                               state="normal" if card.can_start else "disabled",
                               command=lambda f=f: self.start_folder(f)).pack(side="left", padx=(8, 0))
+            if len(folders) > 1:   # the sync order: the top folder is checked first
+                for text, step, enabled in (("↑", -1, i > 0), ("↓", 1, i < len(folders) - 1)):
+                    ctk.CTkButton(btns, text=text, width=28, height=28, **SECONDARY,
+                                  state="normal" if enabled else "disabled",
+                                  command=lambda i=i, step=step: self.move_folder(i, step)).pack(
+                        side="left", padx=(8 if step < 0 else 4, 0))
             for text, cmd, style in (("Open", lambda i=i: self.open_local(i), SECONDARY),
                                      ("Drive", lambda i=i: self.open_drive(i), SECONDARY),
                                      ("Edit", lambda i=i: self.edit_folder(i), SECONDARY),
@@ -904,6 +910,12 @@ class MainWindow:
             if cfg is None:
                 messagebox.showinfo("Drive Sync", ui_model.DUPLICATE_FOLDER, parent=self.root)
                 return
+            self.app.save_config(cfg)
+            self.refresh_folders()
+
+    def move_folder(self, i: int, step: int):
+        cfg = ui_model.move_folder(self.app.cfg, i, step)
+        if cfg is not None:
             self.app.save_config(cfg)
             self.refresh_folders()
 

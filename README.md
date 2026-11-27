@@ -66,7 +66,7 @@ Both options keep settings, logs and the Google logins in `%LOCALAPPDATA%\DriveS
 
 | Tab | What's there |
 |---|---|
-| **Folders** | Your synced folders, each with **Open**, **Drive** (opens it in Google Drive), **Edit** and **Remove** buttons |
+| **Folders** | Your synced folders, each with **Open**, **Drive** (opens it in Google Drive), **Edit** and **Remove** buttons. Folders sync one at a time, top to bottom: with two or more folders, use the **↑** and **↓** buttons on a card to choose which folder is checked first |
 | **Settings** | Google accounts (add, remove, sign in again, and which browser profile each one opens in), instant sync on/off, how often to do a full check, notifications, start with Windows, light/dark mode |
 | **Activity** | What Drive Sync did, newest first and grouped by day. One card per folder sync that changed something, showing counts, the reason it ran, and the account. Click **Show items** for the file list. Filter by **All / Changes / Problems**, or search for a file, folder or account. Problems open automatically. Checks that changed nothing aren't listed; the line at the top shows when the last check ran. The newest 1,000 entries are kept across restarts. **Log file** opens the full technical log (`%LOCALAPPDATA%\DriveSync\logs\drive_sync.log`): every file uploaded, downloaded, moved or trashed, each status change, and every problem with its reason. It keeps about 25 MB (5 files of 5 MB). Unexpected errors are written there with full details, and a run that was force-closed or crashed is noted at the next start. |
 

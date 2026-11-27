@@ -65,6 +65,9 @@ def folder_card(f: dict, email: str | None, known: list[str], signin: set[str], 
 EMPTY_FOLDERS_TITLE = "Back up your first folder"
 EMPTY_FOLDERS_TEXT = "Choose a folder on this PC and Drive Sync will keep a copy in Google Drive."
 FOLDERS_HEADING = "Folders backed up to Google Drive"
+FOLDER_ORDER_HINT = "Folders sync one at a time, top to bottom. Use ↑ and ↓ to choose which syncs first."
+MOVE_UP_TIP = "Sync this folder earlier"
+MOVE_DOWN_TIP = "Sync this folder later"
 DUPLICATE_FOLDER = "That folder is already being synced to this account."
 
 
@@ -90,6 +93,17 @@ def drive_url(f: dict | None, email: str | None, known: list[str], remote_ids: d
 def without_folder(cfg: dict, i: int) -> dict:
     """A copy of the settings with folder number i removed."""
     return {**cfg, "folders": [x for j, x in enumerate(cfg.get("folders", [])) if j != i]}
+
+
+def move_folder(cfg: dict, i: int, step: int) -> dict | None:
+    """The settings with folder i moved `step` places (-1 = up, synced sooner; +1 = down).
+    Folders sync in this order, so the top folder is checked first. None past either end."""
+    folders = list(cfg.get("folders", []))
+    j = i + step
+    if not (0 <= i < len(folders) and 0 <= j < len(folders)):
+        return None
+    folders[i], folders[j] = folders[j], folders[i]
+    return {**cfg, "folders": folders}
 
 
 def remove_folder_question(f: dict) -> str:

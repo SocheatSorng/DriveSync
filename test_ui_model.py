@@ -91,6 +91,21 @@ class FolderActionTests(unittest.TestCase):
         self.assertEqual(out["interval_minutes"], 15)
         self.assertEqual(len(cfg["folders"]), 3)       # the original is left as it was
 
+    def test_move_folder_changes_the_sync_order(self):
+        cfg = {"folders": [folder(local="A"), folder(local="B"), folder(local="C")], "interval_minutes": 15}
+        up = m.move_folder(cfg, 2, -1)
+        self.assertEqual([f["local"] for f in up["folders"]], ["A", "C", "B"])
+        self.assertEqual(up["interval_minutes"], 15)
+        down = m.move_folder(cfg, 0, 1)
+        self.assertEqual([f["local"] for f in down["folders"]], ["B", "A", "C"])
+        self.assertEqual([f["local"] for f in cfg["folders"]], ["A", "B", "C"])   # the original is left as it was
+
+    def test_move_folder_past_either_end_does_nothing(self):
+        cfg = {"folders": [folder(local="A"), folder(local="B")]}
+        self.assertIsNone(m.move_folder(cfg, 0, -1))
+        self.assertIsNone(m.move_folder(cfg, 1, 1))
+        self.assertIsNone(m.move_folder(cfg, 5, -1))
+
     def test_remove_question(self):
         q = m.remove_folder_question(folder())
         self.assertIn(r"D:\Storage\Image", q)

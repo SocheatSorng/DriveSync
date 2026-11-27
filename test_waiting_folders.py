@@ -101,6 +101,17 @@ class WaitingFolderTests(unittest.TestCase):
         self.assertEqual(app.active_folders(app.cfg), [OLD])
         self.assertEqual(self.synced(app, trigger="scheduled", scan=True), [OLD["local"]])
 
+    def test_folders_sync_in_the_order_of_their_cards(self):
+        """The Folders tab's ↑ / ↓ order is the sync order, for full checks and for changes alike."""
+        a = {"local": r"C:\A", "account": EMAIL, "mode": "upload"}
+        b = {"local": r"C:\B", "account": EMAIL, "mode": "upload"}
+        c = {"local": r"C:\C", "account": EMAIL, "mode": "upload"}
+        self.write_config([c, a, b])
+        app = self.app()
+        self.assertEqual(self.synced(app, trigger="manual", full=True), [r"C:\C", r"C:\A", r"C:\B"])
+        only = {self.key(b), self.key(c)}
+        self.assertEqual(self.synced(app, only=only, trigger="changes"), [r"C:\C", r"C:\B"])
+
     def test_full_check_and_sync_now_skip_a_waiting_folder(self):
         app = self.app()
         self.assertEqual(self.synced(app, trigger="manual", full=True, scan=True), [OLD["local"]])

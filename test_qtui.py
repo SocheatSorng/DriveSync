@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import ui_model
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
@@ -219,6 +221,24 @@ class FoldersTabTests(QtTestCase):
         self.assertIn("Stop syncing this folder?", q.call_args.args[2])
         saved = app.save_config.call_args.args[0]
         self.assertEqual([f["local"] for f in saved["folders"]], [self.folders[1]["local"]])
+
+    def test_arrows_change_which_folder_syncs_first(self):
+        app, t = self.tab()
+        up0, down0 = self.buttons(t.cards[0], "↑")[0], self.buttons(t.cards[0], "↓")[0]
+        up1, down1 = self.buttons(t.cards[1], "↑")[0], self.buttons(t.cards[1], "↓")[0]
+        self.assertEqual((up0.isEnabled(), down0.isEnabled(), up1.isEnabled(), down1.isEnabled()),
+                         (False, True, True, False))   # nothing to move past at either end
+        self.assertEqual(up1.toolTip(), "Sync this folder earlier")
+        up1.click()
+        saved = app.save_config.call_args.args[0]
+        self.assertEqual([f["local"] for f in saved["folders"]], [self.folders[1]["local"], self.folders[0]["local"]])
+        self.assertEqual(t.order_hint.text(), ui_model.FOLDER_ORDER_HINT)
+        self.assertFalse(t.order_hint.isHidden())
+
+    def test_one_folder_has_no_arrows_or_order_hint(self):
+        _app, t = self.tab(self.folders[:1])
+        self.assertEqual(self.buttons(t, "↑") + self.buttons(t, "↓"), [])
+        self.assertTrue(t.order_hint.isHidden())
 
     def test_open_and_drive(self):
         app, t = self.tab()

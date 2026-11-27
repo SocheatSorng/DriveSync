@@ -32,6 +32,8 @@ class FoldersTab(QWidget):
         top.addWidget(button("Open Google Drive", lambda: self.open_drive(None)))
         top.addWidget(button("+  Add folder", self.add_folder, "primary"))
         lay.addLayout(top)
+        self.order_hint = label(ui_model.FOLDER_ORDER_HINT, "muted", wrap=True)
+        lay.addWidget(self.order_hint)
         self.area = scroll(QWidget())
         lay.addWidget(self.area, 1)
 
@@ -46,6 +48,7 @@ class FoldersTab(QWidget):
         lay.setSpacing(8)
         self.cards = []
         folders = self.app.cfg.get("folders", [])
+        self.order_hint.setVisible(len(folders) > 1)   # the order only matters with two or more
         if not folders:
             lay.addWidget(self._empty())
         else:
@@ -53,7 +56,7 @@ class FoldersTab(QWidget):
             known = [a["email"] for a in info]
             signin = {a["email"] for a in info if a["needs_signin"]}
             for i, f in enumerate(folders):
-                card = self._card(i, f, known, signin)
+                card = self._card(i, f, known, signin, len(folders))
                 self.cards.append(card)
                 lay.addWidget(card)
         lay.addStretch(1)
@@ -71,7 +74,7 @@ class FoldersTab(QWidget):
         b.addWidget(button("+  Add folder", self.add_folder, "primary"), 0, Qt.AlignmentFlag.AlignHCenter)
         return box
 
-    def _card(self, i: int, f: dict, known: list[str], signin: set[str]) -> QFrame:
+    def _card(self, i: int, f: dict, known: list[str], signin: set[str], count: int) -> QFrame:
         local = f.get("local", "")
         email = self.app.folder_account(f, known)
         card = ui_model.folder_card(f, email, known, signin, self.app.is_waiting(f), os.path.isdir(local))
@@ -87,6 +90,14 @@ class FoldersTab(QWidget):
             start = button("Start syncing", lambda: self.start_folder(f), "primary")
             start.setEnabled(card.can_start)
             btns.addWidget(start)
+        if count > 1:   # the sync order: the top folder is checked first
+            for text, tip, step, enabled in (("↑", ui_model.MOVE_UP_TIP, -1, i > 0),
+                                             ("↓", ui_model.MOVE_DOWN_TIP, 1, i < count - 1)):
+                arrow = button(text, lambda step=step: self.move_folder(i, step), "arrow")
+                arrow.setToolTip(tip)
+                arrow.setAccessibleName(tip)
+                arrow.setEnabled(enabled)
+                btns.addWidget(arrow)
         btns.addWidget(button("Open", lambda: self.open_local(i)))
         btns.addWidget(button("Drive", lambda: self.open_drive(i)))
         btns.addWidget(button("Edit", lambda: self.edit_folder(i)))
@@ -144,6 +155,12 @@ class FoldersTab(QWidget):
         result = FolderDialog.ask(self, self.app, "Edit folder", cfg["folders"][i])
         if result:
             self.app.save_config(ui_model.replace_folder(cfg, i, result))
+            self.refresh()
+
+    def move_folder(self, i: int, step: int) -> None:
+        cfg = ui_model.move_folder(self.app.cfg, i, step)
+        if cfg is not None:
+            self.app.save_config(cfg)
             self.refresh()
 
     def start_folder(self, folder: dict) -> None:

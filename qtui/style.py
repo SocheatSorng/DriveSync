@@ -75,6 +75,8 @@ QPushButton[role="danger-filled"]:hover { background: #b3261e; }
 QPushButton[role="danger-filled"]:disabled { background: $track; color: $muted; }
 QPushButton[role="link"] { border: none; color: $link; padding: 2px 2px; text-align: left; }
 QPushButton[role="link"]:hover { background: transparent; text-decoration: underline; }
+/* the Folders tab's sync-order arrows: a one-colour font (so disabled ones grey out), big enough to read */
+QPushButton[role="arrow"] { padding: 5px 9px; font-family: "Segoe UI Symbol"; font-size: 15px; font-weight: 700; }
 QPushButton[role="row"] { border: none; border-radius: 6px; padding: 6px 10px; text-align: left; }
 QPushButton[role="segment"] { border: none; border-radius: 6px; padding: 4px 12px; color: $muted; }
 QPushButton[role="segment"]:checked { background: $panel; color: $text; }   /* (bold would clip: same width) */
