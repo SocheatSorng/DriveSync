@@ -22,7 +22,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ruff>=0.6",
-    "bandit[toml]>=1.7",
+    "bandit[toml]>=1.9.4",
     "pip-audit>=2.7",
     "pyinstaller>=6.0",
     "pre-commit>=3.5",
